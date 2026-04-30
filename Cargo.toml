@@ -1,0 +1,17 @@
+[package]
+name = "sdmmc-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = "2"
+embedded-hal = "1"
+log = { version = "0.4", optional = true }
+defmt = { version = "0.3", optional = true }
+
+[features]
+default = ["spi"]
+spi = []
+sdio = []
+defmt = ["dep:defmt"]
+log = ["dep:log"]
