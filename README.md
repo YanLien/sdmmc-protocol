@@ -30,9 +30,11 @@ log = ["dep:log"]
 
 ## SPI Mode
 
-The SPI path is built around `SpiTransport`:
+The SPI path is built around `SpiTransport` plus an `embedded_hal::delay::DelayNs`
+implementation that the driver uses for wall-clock timeouts:
 
 ```rust
+use embedded_hal::delay::DelayNs;
 use sdmmc_protocol::Error;
 use sdmmc_protocol::spi::{SpiSdmmc, SpiTransport};
 
@@ -47,14 +49,15 @@ impl SpiTransport for MySpi {
     }
 }
 
-fn example(spi: MySpi) -> Result<(), Error> {
-    let mut card = SpiSdmmc::new(spi);
+fn example<D: DelayNs>(spi: MySpi, delay: D) -> Result<(), Error> {
+    let mut card = SpiSdmmc::new(spi, delay);
     let info = card.init()?;
 
     let mut block = [0u8; 512];
     card.read_block(0, &mut block)?;
 
     let _is_sdhc_or_sdxc = info.high_capacity;
+    let _capacity_blocks = info.capacity_blocks; // Some(blocks) for known CSD versions
     Ok(())
 }
 ```
@@ -62,13 +65,15 @@ fn example(spi: MySpi) -> Result<(), Error> {
 If your platform already exposes an `embedded-hal` 1.0 `SpiDevice<u8>`, wrap it with `SpiDeviceWrapper`:
 
 ```rust
+use embedded_hal::delay::DelayNs;
 use sdmmc_protocol::spi::{SpiDeviceWrapper, SpiSdmmc};
 
-fn create_driver<SPI>(spi: SPI) -> SpiSdmmc<SpiDeviceWrapper<SPI>>
+fn create_driver<SPI, D>(spi: SPI, delay: D) -> SpiSdmmc<SpiDeviceWrapper<SPI>, D>
 where
     SPI: embedded_hal::spi::SpiDevice<u8>,
+    D: DelayNs,
 {
-    SpiSdmmc::new(SpiDeviceWrapper::new(spi))
+    SpiSdmmc::new(SpiDeviceWrapper::new(spi), delay)
 }
 ```
 
@@ -86,9 +91,11 @@ For SDHC/SDXC cards, block addresses are passed through directly. For SDSC cards
 
 ## SDIO Mode
 
-The SDIO path expects the platform to implement `SdioHost`:
+The SDIO path expects the platform to implement `SdioHost`. The driver tracks
+the published RCA itself, so hosts no longer need to snoop R6 responses:
 
 ```rust
+use embedded_hal::delay::DelayNs;
 use sdmmc_protocol::{Command, Error, Response};
 use sdmmc_protocol::sdio::{BusWidth, ClockSpeed, SdioHost, SdioSdmmc};
 
@@ -119,15 +126,13 @@ impl SdioHost for MySdioHost {
         let _ = speed;
         todo!()
     }
-
-    fn rca(&self) -> u16 {
-        todo!()
-    }
 }
 
-fn example(host: MySdioHost) -> Result<(), Error> {
-    let mut card = SdioSdmmc::new(host);
-    let _info = card.init()?;
+fn example<D: DelayNs>(host: MySdioHost, delay: D) -> Result<(), Error> {
+    let mut card = SdioSdmmc::new(host, delay);
+    let info = card.init()?;
+    let _rca = info.rca;
+    let _capacity_blocks = info.capacity_blocks;
     Ok(())
 }
 ```
@@ -179,11 +184,15 @@ cargo test --all-features
 
 - No real hardware examples are included yet.
 - SPI CRC is generated for commands, but data CRC is ignored in SPI mode.
-- Timeouts are fixed retry counts rather than platform time-based deadlines.
 - SDIO has not been validated against a concrete host controller.
-- Card metadata parsing for CID/CSD is not implemented yet.
+- CID parsing is not implemented yet (CSD capacity *is* parsed during init).
 
 ## License
 
-No license file is currently included. Add one before publishing or distributing this crate.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
 

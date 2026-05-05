@@ -1,5 +1,24 @@
 use crate::response::ResponseType;
 
+/// Direction of the data phase that follows a command, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DataDirection {
+    /// No data phase follows this command.
+    None,
+    /// The host reads data from the card after the command response.
+    Read,
+    /// The host writes data to the card after the command response.
+    Write,
+}
+
+impl DataDirection {
+    /// Returns true if this command has no data phase.
+    pub const fn is_none(self) -> bool {
+        matches!(self, DataDirection::None)
+    }
+}
+
 /// SD/MMC command definitions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -18,6 +37,15 @@ impl Command {
         }
     }
 
+    /// Return a copy of this command with `resp_type` overridden.
+    ///
+    /// Useful when the same command index has different response types depending
+    /// on the transport (e.g. ACMD41 returns R3 in native mode but the OCR is
+    /// not available in SPI mode where only an R1 byte is returned).
+    pub const fn with_resp_type(self, resp_type: ResponseType) -> Self {
+        Self { resp_type, ..self }
+    }
+
     /// Command index (0–63)
     pub fn index(&self) -> u8 {
         self.cmd
@@ -26,6 +54,35 @@ impl Command {
     /// 32-bit argument
     pub fn argument(&self) -> u32 {
         self.arg
+    }
+
+    /// Direction of the data phase that follows this command.
+    ///
+    /// Note: SDIO CMD53 carries its direction in the argument; this helper
+    /// returns `None` for it. CMD6 is also returned as `None` because the
+    /// same command index is reused for ACMD6 (SET_BUS_WIDTH, no data phase)
+    /// and CMD6 SWITCH_FUNC (64-byte read). Drivers that issue SWITCH_FUNC
+    /// inform the host explicitly via [`crate::sdio::SdioHost::prepare_data_transfer`].
+    pub const fn data_direction(&self) -> DataDirection {
+        match self.cmd {
+            17 | 18 => DataDirection::Read,
+            24 | 25 => DataDirection::Write,
+            _ => DataDirection::None,
+        }
+    }
+
+    /// Size (in bytes) of the data block this command transfers, when the
+    /// answer is unambiguous from the command index alone.
+    ///
+    /// Returns `None` for commands without a data phase, for commands whose
+    /// block size depends on host configuration (e.g. CMD16-controlled
+    /// SDSC blocks), and for indices that are reused across commands with
+    /// different data shapes (e.g. CMD6).
+    pub const fn data_block_size(&self) -> Option<u32> {
+        match self.cmd {
+            17 | 18 | 24 | 25 => Some(512),
+            _ => None,
+        }
     }
 
     /// Compute the 7-bit CRC for SPI mode transmission
@@ -87,6 +144,18 @@ pub fn cmd4(dsr: u16) -> Command {
 /// CMD6: SWITCH_FUNC — Switch card function
 pub fn cmd6(arg: u32) -> Command {
     Command::new(6, arg, ResponseType::R1)
+}
+
+/// CMD6 helper: switch function group 1 to high speed (50 MHz, function 1).
+///
+/// The card responds with R1 followed by a 64-byte status data block. Use
+/// `mode=true` to actually switch; `mode=false` to query support without
+/// changing the configuration.
+pub fn cmd6_high_speed(switch: bool) -> Command {
+    let mode = if switch { 1u32 << 31 } else { 0 };
+    // groups 6..2 are 0xF (no change), group 1 = 1 (high speed)
+    let groups = 0x00FF_FFF1u32;
+    Command::new(6, mode | groups, ResponseType::R1)
 }
 
 /// CMD7: SELECT/DESELECT CARD
@@ -183,16 +252,21 @@ pub fn cmd1(voltage_window: u32) -> Command {
 pub const CMD5: Command = Command::new(5, 0, ResponseType::R4);
 
 /// CMD52: IO_RW_DIRECT
-pub fn cmd52(write: bool, function: u8, raw: bool, addr: u8, data: u8) -> Command {
+///
+/// `addr` is a 17-bit SDIO register address (bits 25:9 of the command argument).
+pub fn cmd52(write: bool, function: u8, raw: bool, addr: u32, data: u8) -> Command {
     let arg = (write as u32) << 31
         | ((function as u32) & 0x7) << 28
         | (raw as u32) << 27
-        | ((addr as u32) & 0x1FF) << 9
+        | (addr & 0x1_FFFF) << 9
         | (data as u32);
     Command::new(52, arg, ResponseType::R5)
 }
 
 /// CMD53: IO_RW_EXTENDED
+///
+/// `addr` is a 17-bit SDIO register address (bits 25:9 of the command argument).
+/// `count` is a 9-bit byte/block count (bits 8:0).
 pub fn cmd53(
     write: bool,
     function: u8,
@@ -204,8 +278,8 @@ pub fn cmd53(
     let arg = (write as u32) << 31
         | ((function as u32) & 0x7) << 28
         | (block_mode as u32) << 27
-        | (addr & 0x1FF) << 9
         | (op_code as u32) << 26
+        | (addr & 0x1_FFFF) << 9
         | (count as u32 & 0x1FF);
     Command::new(53, arg, ResponseType::R5)
 }
@@ -231,5 +305,67 @@ mod tests {
         assert_eq!(bytes[2], 0x00);
         assert_eq!(bytes[3], 0x01);
         assert_eq!(bytes[4], 0xAA);
+    }
+
+    #[test]
+    fn cmd52_encodes_full_17_bit_address() {
+        let cmd = cmd52(true, 1, false, 0x1_ABCD, 0x55);
+        // write=1, function=001, raw=0, addr=0x1ABCD (bits 25:9), stuff=0, data=0x55
+        let expected = (1u32 << 31) | (1u32 << 28) | (0x1_ABCDu32 << 9) | 0x55;
+        assert_eq!(cmd.arg, expected);
+        assert_eq!(cmd.cmd, 52);
+    }
+
+    #[test]
+    fn cmd53_encodes_full_17_bit_address_and_count() {
+        let cmd = cmd53(false, 2, true, 0x1_FFFF, true, 0x1FF);
+        // write=0, function=010, block_mode=1, op_code=1, addr=0x1FFFF, count=0x1FF
+        let expected = (2u32 << 28) | (1u32 << 27) | (1u32 << 26) | (0x1_FFFFu32 << 9) | 0x1FF;
+        assert_eq!(cmd.arg, expected);
+        assert_eq!(cmd.cmd, 53);
+    }
+
+    #[test]
+    fn data_direction_classifies_block_commands() {
+        assert_eq!(cmd17(0).data_direction(), DataDirection::Read);
+        assert_eq!(cmd18(0).data_direction(), DataDirection::Read);
+        assert_eq!(cmd24(0).data_direction(), DataDirection::Write);
+        assert_eq!(cmd25(0).data_direction(), DataDirection::Write);
+        // CMD6 is overloaded (ACMD6 vs SWITCH_FUNC); drivers tell the host
+        // explicitly rather than relying on the index alone.
+        assert_eq!(cmd6(0).data_direction(), DataDirection::None);
+        assert_eq!(CMD0.data_direction(), DataDirection::None);
+        assert_eq!(CMD12.data_direction(), DataDirection::None);
+        assert!(CMD0.data_direction().is_none());
+    }
+
+    #[test]
+    fn data_block_size_reports_known_lengths() {
+        assert_eq!(cmd17(0).data_block_size(), Some(512));
+        assert_eq!(cmd18(0).data_block_size(), Some(512));
+        assert_eq!(cmd24(0).data_block_size(), Some(512));
+        assert_eq!(cmd25(0).data_block_size(), Some(512));
+        assert_eq!(cmd6(0).data_block_size(), None);
+        assert_eq!(CMD0.data_block_size(), None);
+        assert_eq!(CMD12.data_block_size(), None);
+    }
+
+    #[test]
+    fn cmd6_high_speed_arg_matches_spec() {
+        let switch = cmd6_high_speed(true);
+        assert_eq!(switch.cmd, 6);
+        assert_eq!(switch.arg, 0x80FF_FFF1);
+        let check = cmd6_high_speed(false);
+        assert_eq!(check.arg, 0x00FF_FFF1);
+    }
+
+    #[test]
+    fn with_resp_type_overrides_only_resp_type() {
+        let original = cmd41(true, 0xFF8000);
+        let overridden = original.with_resp_type(ResponseType::R1);
+        assert_eq!(overridden.cmd, original.cmd);
+        assert_eq!(overridden.arg, original.arg);
+        assert_eq!(overridden.resp_type, ResponseType::R1);
+        assert_eq!(original.resp_type, ResponseType::R3);
     }
 }

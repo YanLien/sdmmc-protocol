@@ -1,0 +1,2 @@
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tqemu/riscv64-virt.ld"]
