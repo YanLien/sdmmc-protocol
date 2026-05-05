@@ -1,1 +1,15 @@
+# Rust build artifacts
 /target
+Cargo.lock.bak
+
+# Local scratch / generated images / device trees
+/tmp
+*.img
+*.dtb
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
