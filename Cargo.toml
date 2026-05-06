@@ -25,6 +25,6 @@ defmt = ["dep:defmt"]
 log = ["dep:log"]
 
 [workspace]
-members = [".", "crates/sdhci-host"]
+members = [".", "crates/sdhci-host", "crates/dwmmc-host"]
 resolver = "3"
 
