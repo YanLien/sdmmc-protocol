@@ -152,6 +152,23 @@ impl R1Response {
     pub fn card_is_locked(&self) -> bool {
         self.raw & (1 << 19) != 0
     }
+
+    /// `READY_FOR_DATA` (bit 8): card buffer is empty and the next data
+    /// transfer can be issued. Used after R1b commands (CMD7, CMD12,
+    /// MMC CMD6 SWITCH) to know when the busy line has cleared.
+    ///
+    /// Only meaningful for native (SDIO) R1 responses.
+    pub fn ready_for_data(&self) -> bool {
+        self.raw & (1 << 8) != 0
+    }
+
+    /// `SWITCH_ERROR` (bit 7): the previous MMC CMD6 SWITCH was rejected
+    /// (e.g. invalid EXT_CSD field, value out of range). Surfaces here
+    /// because CMD6 itself returns R1b with this bit, but most error
+    /// reporters hide bits 0..15.
+    pub fn switch_error(&self) -> bool {
+        self.raw & (1 << 7) != 0
+    }
 }
 
 /// Card state machine states

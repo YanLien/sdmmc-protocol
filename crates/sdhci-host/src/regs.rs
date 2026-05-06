@@ -119,6 +119,29 @@ pub(crate) const CLOCK_INTERNAL_ENABLE: u16 = 1 << 0;
 pub(crate) const CLOCK_INTERNAL_STABLE: u16 = 1 << 1;
 pub(crate) const CLOCK_SD_ENABLE: u16 = 1 << 2;
 
+// ── Host Control 2 (UHS-I, tuning, 1.8 V) ─────────────────────────────
+
+/// UHS_MODE_SELECT bits 2..0: 0 = SDR12, 1 = SDR25, 2 = SDR50,
+/// 3 = SDR104 / HS200, 4 = DDR50, 5 = HS400.
+pub(crate) const HOST_CTRL2_UHS_MODE_MASK: u16 = 0b111;
+pub(crate) const HOST_CTRL2_UHS_SDR12: u16 = 0;
+pub(crate) const HOST_CTRL2_UHS_SDR25: u16 = 1;
+pub(crate) const HOST_CTRL2_UHS_SDR50: u16 = 2;
+pub(crate) const HOST_CTRL2_UHS_SDR104: u16 = 3;
+pub(crate) const HOST_CTRL2_UHS_DDR50: u16 = 4;
+pub(crate) const HOST_CTRL2_UHS_HS400: u16 = 5;
+
+/// 1.8 V signaling enable. 0 = 3.3 V, 1 = 1.8 V.
+pub(crate) const HOST_CTRL2_1V8_SIGNALING: u16 = 1 << 3;
+/// Driver strength type select (bits 4-5). 0 = type B (default).
+pub(crate) const HOST_CTRL2_DRIVER_STRENGTH_MASK: u16 = 0b11 << 4;
+/// Execute Tuning — set by software, controller clears it when the
+/// loop is done.
+pub(crate) const HOST_CTRL2_EXECUTE_TUNING: u16 = 1 << 6;
+/// Sampling Clock Select — controller-set after tuning. 1 = tuning
+/// produced a stable phase, 0 = no stable phase / tuning failed.
+pub(crate) const HOST_CTRL2_SAMPLING_CLOCK_SELECT: u16 = 1 << 7;
+
 // ── Transfer Mode ──────────────────────────────────────────────────────
 
 pub(crate) const XFER_MODE_DMA_ENABLE: u16 = 1 << 0;

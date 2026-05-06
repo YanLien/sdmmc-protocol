@@ -179,6 +179,14 @@ pub fn cmd10(rca: u16) -> Command {
     Command::new(10, (rca as u32) << 16, ResponseType::R2)
 }
 
+/// CMD11: VOLTAGE_SWITCH — switch the bus to 1.8 V signaling.
+///
+/// SD 3.0 / UHS-I cards and eMMC HS200 share this command. The card
+/// responds with R1; the actual voltage transition is then driven by
+/// the host controller (gate SD clock → switch IO domain → wait t_VSW
+/// → re-enable clock). Implementations live in the host layer.
+pub const CMD11: Command = Command::new(11, 0, ResponseType::R1);
+
 /// CMD12: STOP_TRANSMISSION — Stop read/write
 pub const CMD12: Command = Command::new(12, 0, ResponseType::R1b);
 
@@ -212,6 +220,29 @@ pub fn cmd25(addr: u32) -> Command {
     Command::new(25, addr, ResponseType::R1)
 }
 
+/// CMD19 (SD): SEND_TUNING_BLOCK — request a 64-byte tuning pattern.
+///
+/// Used by SD UHS-I (SDR50 / SDR104). Response is R1, immediately
+/// followed by a 64-byte data phase the host samples to find a working
+/// clock phase. Tuning is iterated up to 40 times by the host
+/// controller; the protocol layer just issues this command.
+pub const CMD19: Command = Command::new(19, 0, ResponseType::R1);
+
+/// CMD21 (MMC): SEND_TUNING_BLOCK_HS200 — request the HS200 tuning
+/// pattern.
+///
+/// 64 bytes for 4-bit bus, 128 bytes for 8-bit bus. Same role as CMD19
+/// but on eMMC. Host controllers typically exercise this in a tight
+/// loop while sweeping their internal sampling clock.
+pub const CMD21: Command = Command::new(21, 0, ResponseType::R1);
+
+/// Tuning block size for SD CMD19 (always 64 bytes).
+pub const SD_TUNING_BLOCK_SIZE: u32 = 64;
+/// Tuning block size for MMC CMD21 over a 4-bit bus.
+pub const MMC_TUNING_BLOCK_SIZE_4BIT: u32 = 64;
+/// Tuning block size for MMC CMD21 over an 8-bit bus.
+pub const MMC_TUNING_BLOCK_SIZE_8BIT: u32 = 128;
+
 /// CMD32: ERASE_WR_BLK_START
 pub fn cmd32(addr: u32) -> Command {
     Command::new(32, addr, ResponseType::R1)
@@ -244,6 +275,53 @@ pub const CMD58: Command = Command::new(58, 0, ResponseType::R3);
 /// CMD1: SEND_OP_COND (MMC)
 pub fn cmd1(voltage_window: u32) -> Command {
     Command::new(1, voltage_window, ResponseType::R3)
+}
+
+/// CMD6 (MMC): SWITCH — modify a single byte of EXT_CSD.
+///
+/// `access` selects how the value is applied (`0b11` = `WRITE_BYTE`,
+/// `0b10` = `SET_BITS`, `0b01` = `CLEAR_BITS`). `index` is the EXT_CSD
+/// byte offset (0..511). After issuing this the host must wait for the
+/// busy line to clear (R1b) and then poll CMD13 to confirm the card
+/// returned to `tran` and did not set `SWITCH_ERROR`.
+pub fn cmd6_mmc_switch(access: u8, index: u8, value: u8) -> Command {
+    let arg = ((access as u32) << 24) | ((index as u32) << 16) | ((value as u32) << 8);
+    Command::new(6, arg, ResponseType::R1b)
+}
+
+/// CMD8 (MMC): SEND_EXT_CSD — read the 512-byte extended CSD register.
+///
+/// **Important**: this is a *different* CMD8 than the SD `SEND_IF_COND`.
+/// MMC CMD8 carries a data phase (R1 followed by a 512-byte read),
+/// while SD CMD8 has no data and uses R7. The protocol layer picks the
+/// right one based on the card kind.
+pub const CMD8_MMC: Command = Command::new(8, 0, ResponseType::R1);
+
+/// EXT_CSD byte offsets the driver currently consumes. Full register is
+/// 512 bytes; only document the ones we read.
+pub mod ext_csd {
+    /// Card type (HS / HS200 / HS400 support bitmap).
+    pub const DEVICE_TYPE: usize = 196;
+    /// Selected timing mode after CMD6 (0 = backwards compat,
+    /// 1 = HS, 2 = HS200, 3 = HS400). Same byte is also written to
+    /// switch modes.
+    pub const HS_TIMING: usize = 185;
+    /// Selected bus width (0 = 1-bit, 1 = 4-bit, 2 = 8-bit;
+    /// 5 = 4-bit DDR, 6 = 8-bit DDR).
+    pub const BUS_WIDTH: usize = 183;
+    /// Sector count (LE u32) — authoritative capacity for ≥2 GB cards.
+    pub const SEC_COUNT: usize = 212;
+
+    pub mod device_type {
+        /// Supports HS @ 26 MHz.
+        pub const HS_26: u8 = 1 << 0;
+        /// Supports HS @ 52 MHz.
+        pub const HS_52: u8 = 1 << 1;
+        /// Supports HS200 @ 200 MHz, 1.8 V.
+        pub const HS200_18V: u8 = 1 << 4;
+        /// Supports HS200 @ 200 MHz, 1.2 V.
+        pub const HS200_12V: u8 = 1 << 5;
+    }
 }
 
 // ── SDIO specific commands ──

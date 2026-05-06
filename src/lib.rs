@@ -73,6 +73,7 @@ pub mod cmd;
 mod common;
 mod diag;
 pub mod error;
+pub mod ext_csd;
 pub mod response;
 
 #[cfg(feature = "spi")]

@@ -70,7 +70,7 @@ pub use host::Sdhci;
 use sdmmc_protocol::cmd::{Command, DataDirection};
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 use sdmmc_protocol::response::Response;
-use sdmmc_protocol::sdio::{BusWidth, ClockSpeed, SdioHost};
+use sdmmc_protocol::sdio::{BusWidth, ClockSpeed, SdioHost, SignalVoltage};
 
 use crate::host::PendingData;
 use crate::regs::*;
@@ -110,6 +110,7 @@ impl SdioHost for Sdhci {
             ClockSpeed::HighSpeed | ClockSpeed::Sdr25 => 50_000_000,
             ClockSpeed::Sdr50 | ClockSpeed::Ddr50 => 50_000_000,
             ClockSpeed::Sdr104 => 104_000_000,
+            ClockSpeed::Hs200 => 200_000_000,
         };
 
         // Toggle the High-Speed Enable bit in HOST_CONTROL1 alongside the
@@ -163,5 +164,111 @@ impl SdioHost for Sdhci {
             });
         }
         Ok(())
+    }
+
+    fn switch_voltage(&mut self, voltage: SignalVoltage) -> Result<(), Error> {
+        // 1. Stop the SD clock so we don't drive the bus during the
+        //    transition. Spec calls for ≥ 5 ms here; the controller's
+        //    `1.8V Signaling Enable` bit toggles the IO domain
+        //    immediately, so the wait is a soft requirement enforced by
+        //    the platform delay (we don't have one here — bring-up code
+        //    on the caller side should add one if needed).
+        self.disable_sd_clock();
+
+        // 2. Flip the voltage selector. 1.2 V isn't part of the SDHCI
+        //    standard register — surface as Unsupported so the protocol
+        //    layer falls back instead of silently doing the wrong thing.
+        let mut ctrl2 = self.read_u16(REG_HOST_CONTROL2);
+        match voltage {
+            SignalVoltage::V330 => {
+                ctrl2 &= !HOST_CTRL2_1V8_SIGNALING;
+                self.set_power(POWER_330);
+            }
+            SignalVoltage::V180 => {
+                ctrl2 |= HOST_CTRL2_1V8_SIGNALING;
+                self.set_power(POWER_180);
+            }
+            SignalVoltage::V120 => return Err(Error::UnsupportedCommand),
+        }
+        self.write_u16(REG_HOST_CONTROL2, ctrl2);
+
+        // 3. Bring the SD clock back on. The protocol layer's next
+        //    `set_clock` call will pick the appropriate divider for
+        //    whatever speed mode we're transitioning into.
+        let cur = self.read_u16(REG_CLOCK_CONTROL);
+        self.write_u16(REG_CLOCK_CONTROL, cur | CLOCK_SD_ENABLE);
+
+        // 4. Sanity check: when entering 1.8 V the spec requires
+        //    DAT[3:0] to be high after the switch (PRESENT_STATE bits
+        //    20..23). We don't enforce this in the MVP because some
+        //    QEMU models leave the bits dangling; real hardware
+        //    integrators should add the check here.
+        Ok(())
+    }
+
+    fn execute_tuning(&mut self, cmd_index: u8) -> Result<(), Error> {
+        // Only CMD19 (SD UHS-I) and CMD21 (eMMC HS200) make sense here.
+        // Reject anything else loudly so the protocol layer doesn't
+        // accidentally tune for a non-tuning command.
+        if cmd_index != 19 && cmd_index != 21 {
+            return Err(Error::InvalidArgument);
+        }
+
+        // Block size for the tuning data phase: SD CMD19 always 64,
+        // MMC CMD21 is 64 (4-bit) or 128 (8-bit). The host doesn't
+        // know the bus width here without snooping HOST_CONTROL1; we
+        // read it back to pick the right size.
+        let block_size: u16 = if cmd_index == 21
+            && self.read_u8(REG_HOST_CONTROL1) & HOST_CTRL1_8BIT != 0
+        {
+            128
+        } else {
+            64
+        };
+
+        // Pre-program the data registers per SDHCI v3 §3.7.7. The
+        // controller issues the tuning command itself; we just hand it
+        // the shape of the data phase.
+        self.write_u16(REG_BLOCK_SIZE, block_size & 0x0FFF);
+        self.write_u16(REG_BLOCK_COUNT, 1);
+        self.write_u8(REG_TIMEOUT_CONTROL, 0x0E);
+        // Direction = read, single block, DMA disabled.
+        self.write_u16(REG_TRANSFER_MODE, XFER_MODE_BLOCK_COUNT_ENABLE | XFER_MODE_READ);
+
+        // 1. Set the Execute Tuning bit. The controller takes over and
+        //    issues the tuning command repeatedly while sweeping its
+        //    sampling clock; software just polls the bit until it
+        //    self-clears, then checks Sampling Clock Select to know
+        //    whether the sweep landed on a stable phase.
+        let mut ctrl2 = self.read_u16(REG_HOST_CONTROL2);
+        ctrl2 |= HOST_CTRL2_EXECUTE_TUNING;
+        self.write_u16(REG_HOST_CONTROL2, ctrl2);
+
+        // SDHCI spec caps the loop at 40 iterations × 5 ms each — a
+        // worst case of 200 ms. We pick a conservative poll budget
+        // around that.
+        const TUNING_POLLS: u32 = 1_000_000;
+        let mut last_status = 0u16;
+        for _ in 0..TUNING_POLLS {
+            last_status = self.read_u16(REG_HOST_CONTROL2);
+            if last_status & HOST_CTRL2_EXECUTE_TUNING == 0 {
+                // Controller's done. Sampling Clock Select tells us
+                // whether the sweep produced a usable phase.
+                if last_status & HOST_CTRL2_SAMPLING_CLOCK_SELECT != 0 {
+                    return Ok(());
+                }
+                return Err(Error::BadResponse(ErrorContext::for_cmd(
+                    Phase::Init,
+                    cmd_index,
+                )));
+            }
+            core::hint::spin_loop();
+        }
+
+        // Tuning didn't converge in our poll budget. Clear the bit so
+        // the next attempt starts clean, and surface a timeout.
+        let cleared = last_status & !HOST_CTRL2_EXECUTE_TUNING;
+        self.write_u16(REG_HOST_CONTROL2, cleared);
+        Err(Error::Timeout(ErrorContext::for_cmd(Phase::Init, cmd_index)))
     }
 }

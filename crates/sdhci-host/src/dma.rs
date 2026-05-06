@@ -363,6 +363,14 @@ impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
         }
         Ok(())
     }
+
+    fn switch_voltage(&mut self, voltage: sdmmc_protocol::sdio::SignalVoltage) -> Result<(), Error> {
+        self.inner.switch_voltage(voltage)
+    }
+
+    fn execute_tuning(&mut self, cmd_index: u8) -> Result<(), Error> {
+        self.inner.execute_tuning(cmd_index)
+    }
 }
 
 #[cfg(test)]
