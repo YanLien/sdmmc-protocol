@@ -20,8 +20,11 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: clippy (${{ matrix.features }})
+  # Per-crate feature matrices so a feature on one crate can't accidentally
+  # enable a feature on another. sdhci-host pulls sdmmc-protocol/sdio
+  # transitively, which is why it's spelled out as its own job.
+  clippy-protocol:
+    name: clippy sdmmc-protocol (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -37,10 +40,29 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --lib --tests ${{ matrix.features }} -- -D warnings
+      - run: cargo clippy -p sdmmc-protocol --lib --tests ${{ matrix.features }} -- -D warnings
 
-  test:
-    name: test (${{ matrix.features }})
+  clippy-sdhci-host:
+    name: clippy sdhci-host (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "--features log"
+          - "--features defmt"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p sdhci-host --lib --tests ${{ matrix.features }} -- -D warnings
+
+  test-protocol:
+    name: test sdmmc-protocol (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -54,27 +76,42 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --lib ${{ matrix.features }}
+      - run: cargo test -p sdmmc-protocol --lib ${{ matrix.features }}
+
+  test-sdhci-host:
+    name: test sdhci-host
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p sdhci-host --all-features
 
   check-no-std:
-    name: cross-check riscv64gc-unknown-none-elf
+    name: cross-check ${{ matrix.target }} (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        target:
+          - riscv64gc-unknown-none-elf
+          - aarch64-unknown-none
         features:
-          - "--no-default-features --features spi"
-          - "--no-default-features --features sdio"
-          - "--no-default-features --features spi,sdio"
-          - "--no-default-features --features spi,defmt"
-          - "--no-default-features --features sdio,log"
+          - "-p sdmmc-protocol --no-default-features --features spi"
+          - "-p sdmmc-protocol --no-default-features --features sdio"
+          - "-p sdmmc-protocol --no-default-features --features spi,sdio"
+          - "-p sdmmc-protocol --no-default-features --features spi,defmt"
+          - "-p sdmmc-protocol --no-default-features --features sdio,log"
+          - "-p sdhci-host"
+          - "-p sdhci-host --features log"
+          - "-p sdhci-host --features defmt"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: riscv64gc-unknown-none-elf
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --lib --target riscv64gc-unknown-none-elf ${{ matrix.features }}
+      - run: cargo check --lib --target ${{ matrix.target }} ${{ matrix.features }}
 
   msrv:
     name: MSRV (1.85.0)
@@ -84,9 +121,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       # Lock file is generated against current stable; regenerate with the
-      # MSRV toolchain so resolver=2 / edition2024 resolution stays accurate.
+      # MSRV toolchain so resolver=3 / edition2024 resolution stays accurate.
       - run: cargo +1.85.0 generate-lockfile
-      - run: cargo check --lib --all-features
+      - run: cargo check --workspace --lib --all-features
 
   docs:
     name: cargo doc
@@ -97,4 +134,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --workspace --no-deps --all-features
