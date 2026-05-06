@@ -21,12 +21,13 @@ real hardware. PIO data path only.
 | Area                | Implemented |
 |---------------------|-------------|
 | PIO read / write    | ✅          |
+| ADMA2 (32-bit) read / write | ✅  |
 | 1-bit / 4-bit bus   | ✅          |
 | Default speed       | ✅          |
 | High Speed (50 MHz) | ✅          |
 | 32-bit / 136-bit responses | ✅   |
 | Software reset / clock setup | ✅ |
-| DMA / ADMA2         | ❌          |
+| ADMA2 (64-bit / v4) | ❌          |
 | 8-bit eMMC bus      | ❌ (returns `UnsupportedCommand`) |
 | HS200 / SDR50 / SDR104 | ❌      |
 | 1.8 V signaling switch (CMD11) | ❌ |

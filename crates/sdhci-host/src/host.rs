@@ -27,6 +27,16 @@ pub(crate) struct PendingData {
 pub struct Sdhci {
     base_addr: usize,
     pub(crate) pending_data: Option<PendingData>,
+    /// When set, [`issue_command`] programs the controller's transfer mode
+    /// register with `DMA_ENABLE`. Set by the ADMA2 wrapper just before it
+    /// fires off a command; default `false` keeps the PIO `Sdhci` API
+    /// identical.
+    pub(crate) use_dma: bool,
+    /// Optional CRU-side clock callback. When set, the `SdioHost::set_clock`
+    /// impl will route requests to this hook (and program the controller
+    /// for 1:1 passthrough) instead of using the internal 10-bit divider.
+    /// Used on controllers whose internal divider is unusable.
+    pub(crate) ext_clock: Option<fn(target_hz: u32) -> Result<(), Error>>,
 }
 
 impl Sdhci {
@@ -40,7 +50,22 @@ impl Sdhci {
         Self {
             base_addr,
             pending_data: None,
+            use_dma: false,
+            ext_clock: None,
         }
+    }
+
+    /// Install a CRU-side clock callback so subsequent `set_clock` calls
+    /// retune the platform's reference clock instead of using the SDHCI
+    /// internal divider. The callback receives the desired SD bus
+    /// frequency in Hz; on success it must guarantee the controller's
+    /// input reference clock equals that value before returning.
+    ///
+    /// After installing the callback, the host runs in "external clock"
+    /// mode: the SDHCI internal divider stays at 1:1, all rate control
+    /// is delegated to the platform.
+    pub fn set_external_clock(&mut self, cb: fn(u32) -> Result<(), Error>) {
+        self.ext_clock = Some(cb);
     }
 
     /// Reset the controller (CMD line + DAT line + state) by writing the
@@ -112,6 +137,44 @@ impl Sdhci {
         Err(Error::Timeout(ErrorContext::new(Phase::Init)))
     }
 
+    /// Bypass the internal divider and trust the platform-supplied ref
+    /// clock to already be at the SD bus frequency.
+    ///
+    /// Use this on controllers whose internal 10-bit divider is unusable
+    /// (e.g. DWC MSHC variants, or cores that report `BaseClockFreq = 0`
+    /// in Capabilities and require the SoC's CRU to do all the frequency
+    /// scaling). In that mode the caller is expected to:
+    ///
+    /// 1. Reprogram the SoC clock controller so the controller's input
+    ///    reference clock equals the desired SD bus frequency.
+    /// 2. Call `enable_clock_external()` to gate the SD clock on with a
+    ///    1:1 divider.
+    ///
+    /// If `target_hz` is 0 the SD clock is left disabled.
+    pub fn enable_clock_external(&mut self) -> Result<(), Error> {
+        // Disable, then re-enable with divider = 0 (== 1:1 passthrough).
+        self.write_u16(REG_CLOCK_CONTROL, 0);
+        let clk_ctrl = CLOCK_INTERNAL_ENABLE; // div=0
+        self.write_u16(REG_CLOCK_CONTROL, clk_ctrl);
+        for _ in 0..1000 {
+            if self.read_u16(REG_CLOCK_CONTROL) & CLOCK_INTERNAL_STABLE != 0 {
+                let stable = self.read_u16(REG_CLOCK_CONTROL) | CLOCK_SD_ENABLE;
+                self.write_u16(REG_CLOCK_CONTROL, stable);
+                return Ok(());
+            }
+            spin_loop();
+        }
+        Err(Error::Timeout(ErrorContext::new(Phase::Init)))
+    }
+
+    /// Disable the SD clock without reprogramming the divider. Use this
+    /// before reprogramming the external (CRU) clock so glitches don't
+    /// reach the card.
+    pub fn disable_sd_clock(&mut self) {
+        let cur = self.read_u16(REG_CLOCK_CONTROL);
+        self.write_u16(REG_CLOCK_CONTROL, cur & !CLOCK_SD_ENABLE);
+    }
+
     /// Set bus power (e.g. 3.3 V) and the global power-on bit.
     pub fn set_power(&mut self, power_byte: u8) {
         self.write_u8(REG_POWER_CONTROL, power_byte | POWER_ON);
@@ -136,6 +199,27 @@ impl Sdhci {
         // sdhci-pci reports a v2 layout but the result is still right.
         let mhz = (caps_low >> 8) & 0xFF;
         mhz.saturating_mul(1_000_000)
+    }
+
+    /// Whether the controller advertises ADMA2 in the capabilities register.
+    pub fn supports_adma2(&self) -> bool {
+        self.read_u32(REG_CAPABILITIES_LOW) & CAPS_LOW_ADMA2_SUPPORTED != 0
+    }
+
+    /// Program the ADMA system address registers with the bus address of
+    /// the descriptor table. 32-bit ADMA2 only; the high half is zeroed
+    /// because controllers that don't implement v4 64-bit addressing
+    /// alias the high register to RO-zero anyway.
+    pub(crate) fn write_adma_addr(&self, addr: u32) {
+        self.write_u32(REG_ADMA_SYS_ADDR_LOW, addr);
+        self.write_u32(REG_ADMA_SYS_ADDR_HIGH, 0);
+    }
+
+    /// Pick 32-bit ADMA2 in HOST_CONTROL1's DMA select field.
+    pub(crate) fn select_adma2_32(&mut self) {
+        let mut ctrl = self.read_u8(REG_HOST_CONTROL1);
+        ctrl = (ctrl & !HOST_CTRL1_DMA_SEL_MASK) | HOST_CTRL1_DMA_SEL_ADMA2_32;
+        self.write_u8(REG_HOST_CONTROL1, ctrl);
     }
 
     /// Read raw 32-bit response slot.

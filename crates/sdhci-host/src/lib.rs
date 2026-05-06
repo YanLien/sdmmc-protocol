@@ -6,12 +6,12 @@
 //!
 //! # Scope
 //!
-//! - **Implemented**: PIO transfers, 1-bit / 4-bit bus, default-speed and
-//!   high-speed clocking, 32-bit response slots, 136-bit R2 reconstruction,
-//!   software reset / clock setup.
-//! - **Out of scope (for now)**: DMA, ADMA2, 8-bit eMMC bus, HS200 / SDR50 /
-//!   SDR104 clocking, voltage / signaling switch (CMD11), tuning (CMD19 /
-//!   CMD21), eMMC-specific commands.
+//! - **Implemented**: PIO transfers, **ADMA2 (32-bit) transfers**, 1-bit /
+//!   4-bit bus, default-speed and high-speed clocking, 32-bit response
+//!   slots, 136-bit R2 reconstruction, software reset / clock setup.
+//! - **Out of scope (for now)**: 64-bit ADMA2, 8-bit eMMC bus, HS200 /
+//!   SDR50 / SDR104 clocking, voltage / signaling switch (CMD11), tuning
+//!   (CMD19 / CMD21), eMMC-specific commands.
 //!
 //! # Usage
 //!
@@ -27,6 +27,29 @@
 //! // card.init()?;
 //! ```
 //!
+//! For ADMA2, wrap the controller in [`SdhciAdma2`] and supply a [`Dma`]
+//! implementation plus a caller-owned [`Adma2Buffer`]:
+//!
+//! ```no_run
+//! use embedded_hal::delay::DelayNs;
+//! use sdhci_host::{Adma2Buffer, Dma, DmaDir, Sdhci, SdhciAdma2};
+//! use sdmmc_protocol::sdio::SdioSdmmc;
+//!
+//! struct IdentityDma;
+//! impl Dma for IdentityDma {
+//!     fn map(&self, p: *const u8, _len: usize, _dir: DmaDir) -> u64 { p as u64 }
+//!     fn before_dma(&self, _: *const u8, _: usize, _: DmaDir) {}
+//!     fn after_dma(&self, _: *const u8, _: usize, _: DmaDir) {}
+//! }
+//!
+//! let table = Adma2Buffer::new();
+//!
+//! # fn make_delay() -> impl DelayNs { struct N; impl DelayNs for N { fn delay_ns(&mut self, _: u32) {} } N }
+//! let inner = unsafe { Sdhci::new(0xFE31_0000) };
+//! let host = SdhciAdma2::new(inner, IdentityDma, &table);
+//! let mut card = SdioSdmmc::new(host, make_delay());
+//! ```
+//!
 //! Construction is `unsafe` because the caller must guarantee that the
 //! supplied address is a valid, exclusively-owned SDHCI register file.
 //!
@@ -37,9 +60,11 @@
 
 mod command;
 mod data;
+mod dma;
 mod host;
 mod regs;
 
+pub use dma::{Adma2Buffer, Dma, DmaDir, SdhciAdma2, ADMA2_DESC_COUNT};
 pub use host::Sdhci;
 
 use sdmmc_protocol::cmd::{Command, DataDirection};
@@ -98,6 +123,14 @@ impl SdioHost for Sdhci {
         }
         self.write_u8(REG_HOST_CONTROL1, ctrl);
 
+        // External-clock mode: gate SD clock off, ask the platform CRU to
+        // retune the reference clock, then bring SD clock back up at 1:1.
+        if let Some(cb) = self.ext_clock {
+            self.disable_sd_clock();
+            cb(target_hz)?;
+            return self.enable_clock_external();
+        }
+
         let base = self.base_clock_hz();
         if base == 0 {
             return Err(Error::BadResponse(ErrorContext::new(Phase::Init)));
@@ -118,6 +151,8 @@ impl SdioHost for Sdhci {
         block_size: u32,
         block_count: u32,
     ) -> Result<(), Error> {
+        // Plain PIO: never set the DMA bit in the transfer-mode register.
+        self.use_dma = false;
         if direction.is_none() {
             self.pending_data = None;
         } else {

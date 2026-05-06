@@ -34,7 +34,7 @@ impl Sdhci {
 
         // 3. Configure the data phase (block size + count + transfer mode).
         if let Some(d) = data {
-            self.configure_data_phase(d.direction, d.block_size, d.block_count);
+            self.configure_data_phase(d.direction, d.block_size, d.block_count, self.use_dma);
         } else {
             self.write_u16(REG_TRANSFER_MODE, 0);
         }
@@ -64,6 +64,42 @@ impl Sdhci {
         )?;
         self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_XFER_COMPLETE);
         Ok(())
+    }
+
+    /// Same as [`wait_data_complete`] but also surfaces ADMA-engine
+    /// errors. Used by the DMA data path.
+    pub fn wait_data_complete_with_adma(
+        &self,
+        cmd_index: u8,
+        phase: Phase,
+    ) -> Result<(), Error> {
+        for _ in 0..POLL_LIMIT {
+            let status = self.read_u16(REG_NORMAL_INT_STATUS);
+            if status & NORMAL_INT_XFER_COMPLETE != 0 {
+                self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_XFER_COMPLETE);
+                return Ok(());
+            }
+            if status & NORMAL_INT_ERROR != 0 {
+                let err = self.read_u16(REG_ERROR_INT_STATUS);
+                self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+                let ctx = ErrorContext::for_cmd(phase, cmd_index);
+                return Err(if err & ERROR_INT_ADMA != 0 {
+                    // ADMA engine raised an error — treat as misaligned
+                    // descriptor / address overrun.
+                    Error::Misaligned
+                } else if err & (ERROR_INT_DATA_TIMEOUT | ERROR_INT_CMD_TIMEOUT) != 0 {
+                    Error::Timeout(ctx)
+                } else if err & (ERROR_INT_DATA_CRC | ERROR_INT_CMD_CRC) != 0 {
+                    Error::Crc(ctx)
+                } else if matches!(phase, Phase::DataRead) {
+                    Error::ReadError(ctx)
+                } else {
+                    Error::WriteError(ctx)
+                });
+            }
+            core::hint::spin_loop();
+        }
+        Err(Error::Timeout(ErrorContext::for_cmd(phase, cmd_index)))
     }
 
     fn wait_inhibit(&self, has_data: bool, cmd_index: u8) -> Result<(), Error> {
@@ -122,6 +158,7 @@ impl Sdhci {
         direction: sdmmc_protocol::DataDirection,
         block_size: u32,
         block_count: u32,
+        use_dma: bool,
     ) {
         // SDHCI block size register: bits 11..0 hold block length, bits
         // 14..12 hold the SDMA buffer boundary (we use 0 = 4 KiB).
@@ -137,7 +174,9 @@ impl Sdhci {
         if matches!(direction, sdmmc_protocol::DataDirection::Read) {
             mode |= XFER_MODE_READ;
         }
-        // PIO mode → DMA bit cleared.
+        if use_dma {
+            mode |= XFER_MODE_DMA_ENABLE;
+        }
         self.write_u8(REG_TIMEOUT_CONTROL, 0x0E);
         self.write_u16(REG_TRANSFER_MODE, mode);
     }

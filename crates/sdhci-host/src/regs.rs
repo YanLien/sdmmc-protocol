@@ -34,6 +34,9 @@ pub(crate) const REG_ERROR_INT_SIGNAL_ENABLE: usize = 0x3A;
 pub(crate) const REG_HOST_CONTROL2: usize = 0x3E;
 pub(crate) const REG_CAPABILITIES_LOW: usize = 0x40;
 pub(crate) const REG_CAPABILITIES_HIGH: usize = 0x44;
+pub(crate) const REG_ADMA_ERROR: usize = 0x54;
+pub(crate) const REG_ADMA_SYS_ADDR_LOW: usize = 0x58;
+pub(crate) const REG_ADMA_SYS_ADDR_HIGH: usize = 0x5C;
 pub(crate) const REG_HOST_VERSION: usize = 0xFE;
 
 // ── Present State ──────────────────────────────────────────────────────
@@ -83,11 +86,25 @@ pub(crate) const ERROR_INT_CMD_LINE_MASK: u16 =
 pub(crate) const ERROR_INT_DATA_LINE_MASK: u16 =
     ERROR_INT_DATA_TIMEOUT | ERROR_INT_DATA_CRC | ERROR_INT_DATA_END_BIT;
 
+pub(crate) const ERROR_INT_DATA_OR_ADMA_MASK: u16 = ERROR_INT_DATA_LINE_MASK | ERROR_INT_ADMA;
+
 // ── Host Control 1 ─────────────────────────────────────────────────────
 
 pub(crate) const HOST_CTRL1_4BIT: u8 = 1 << 1;
 pub(crate) const HOST_CTRL1_HIGH_SPEED: u8 = 1 << 2;
 pub(crate) const HOST_CTRL1_8BIT: u8 = 1 << 5;
+
+// DMA select (HOST_CONTROL1 bits 4..3):
+//   00 = SDMA, 10 = 32-bit ADMA2, 11 = 64-bit ADMA2 (v4)
+pub(crate) const HOST_CTRL1_DMA_SEL_MASK: u8 = 0b11 << 3;
+pub(crate) const HOST_CTRL1_DMA_SEL_SDMA: u8 = 0b00 << 3;
+pub(crate) const HOST_CTRL1_DMA_SEL_ADMA2_32: u8 = 0b10 << 3;
+pub(crate) const HOST_CTRL1_DMA_SEL_ADMA2_64: u8 = 0b11 << 3;
+
+// ── Capabilities ───────────────────────────────────────────────────────
+
+pub(crate) const CAPS_LOW_ADMA2_SUPPORTED: u32 = 1 << 19;
+pub(crate) const CAPS_LOW_64BIT_SYSBUS_V3: u32 = 1 << 28;
 
 // ── Power Control ──────────────────────────────────────────────────────
 
