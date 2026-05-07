@@ -15,21 +15,18 @@ use crate::cmd::ext_csd;
 /// `RPMB_SIZE_MULT`, `PARTITION_SETTING_COMPLETED`) without having to
 /// re-issue CMD8.
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ExtCsd {
     raw: [u8; 512],
 }
 
 /// `DEVICE_TYPE` (EXT_CSD[196]) decoded into supported high-speed modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceType {
     pub raw: u8,
 }
 
 /// Currently selected MMC bus width, decoded from `BUS_WIDTH` (EXT_CSD[183]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MmcBusWidth {
     /// 1-bit SDR.
     Sdr1,
@@ -47,7 +44,6 @@ pub enum MmcBusWidth {
 
 /// Currently selected MMC timing mode, decoded from `HS_TIMING` (EXT_CSD[185]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MmcTiming {
     /// Backwards-compatible (≤ 26 MHz).
     Compat,

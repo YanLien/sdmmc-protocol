@@ -9,7 +9,6 @@
 /// can distinguish e.g. a CMD0 send timeout from a `BusyWait` programming
 /// timeout without parsing log strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Phase {
     /// Phase was not recorded.
     ///
@@ -41,7 +40,6 @@ pub enum Phase {
 /// raised the error, and which CMD/ACMD index was being processed at
 /// the time, when known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ErrorContext {
     /// Pipeline phase when the fault was raised.
     pub phase: Phase,
@@ -73,7 +71,6 @@ impl ErrorContext {
 /// programming errors (`Misaligned`, `InvalidArgument`) and card-state
 /// reports (`NoCard`, `CardError`, `CardLocked`) do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
     /// No response from card within the deadline for the wrapped phase.
     Timeout(ErrorContext),
@@ -103,7 +100,6 @@ pub enum Error {
 
 /// Per-bit error status decoded out of an R1 response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CardError {
     /// A command was issued out of sequence.
     IllegalCommand,

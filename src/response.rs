@@ -2,7 +2,6 @@ use crate::error::{CardError, Error, ErrorContext, Phase};
 
 /// SD/MMC response types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResponseType {
     /// No response
     None,
@@ -26,7 +25,6 @@ pub enum ResponseType {
 
 /// Parsed response from the card
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Response {
     None,
     R1(R1Response),
@@ -41,7 +39,6 @@ pub enum Response {
 
 /// R1: Standard response — contains status bits
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct R1Response {
     pub raw: u32,
 }
@@ -173,7 +170,6 @@ impl R1Response {
 
 /// Card state machine states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CardState {
     Idle,
     Ready,
@@ -189,7 +185,6 @@ pub enum CardState {
 
 /// OCR register (R3/CMD58 response)
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct OcrResponse {
     pub raw: u32,
 }
@@ -247,7 +242,6 @@ impl OcrResponse {
 
 /// R6: Published RCA response
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RcaResponse {
     pub raw: u32,
 }
@@ -270,7 +264,6 @@ impl RcaResponse {
 
 /// R7: Interface condition response
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct IfCondResponse {
     pub raw: u32,
 }
@@ -299,7 +292,6 @@ impl IfCondResponse {
 /// CSD register (CMD9 response, raw 16 bytes MSB-first as delivered by both
 /// SPI and SDIO transports).
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CsdResponse {
     pub raw: [u8; 16],
 }
@@ -361,7 +353,6 @@ impl CsdResponse {
 /// Field layout follows SD Physical Layer spec section 5.2; only SD cards are
 /// decoded here. eMMC uses a different field layout and is not supported.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CidResponse {
     pub raw: [u8; 16],
 }
@@ -422,7 +413,6 @@ impl CidResponse {
 /// numbering uses the spec's bit-435..=0 convention but accessors here are
 /// expressed in byte offsets within `raw[0..64]` for clarity.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SwitchStatus {
     pub raw: [u8; 64],
 }
@@ -458,7 +448,6 @@ impl SwitchStatus {
 
 /// SDIO OCR (R4/CMD5 response)
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SdioOcrResponse {
     pub raw: u32,
 }
@@ -486,7 +475,6 @@ impl SdioOcrResponse {
 
 /// SDIO R5 response
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SdioRwResponse {
     pub raw: u32,
 }

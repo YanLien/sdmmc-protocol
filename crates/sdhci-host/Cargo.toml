@@ -2,8 +2,7 @@
 name = "sdhci-host"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "SDHCI host controller backend for sdmmc-protocol (no_std, PIO)"
 repository = "https://github.com/YanLien/sdmmc-protocol"
 readme = "README.md"
@@ -13,10 +12,4 @@ categories = ["embedded", "no-std", "hardware-support"]
 [dependencies]
 sdmmc-protocol = { path = "../..", default-features = false, features = ["sdio"] }
 embedded-hal = "1"
-log = { version = "0.4", optional = true }
-defmt = { version = "0.3", optional = true }
-
-[features]
-default = []
-log = ["dep:log", "sdmmc-protocol/log"]
-defmt = ["dep:defmt", "sdmmc-protocol/defmt"]
+log = "0.4"

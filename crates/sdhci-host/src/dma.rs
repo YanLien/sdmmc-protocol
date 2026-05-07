@@ -364,7 +364,10 @@ impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
         Ok(())
     }
 
-    fn switch_voltage(&mut self, voltage: sdmmc_protocol::sdio::SignalVoltage) -> Result<(), Error> {
+    fn switch_voltage(
+        &mut self,
+        voltage: sdmmc_protocol::sdio::SignalVoltage,
+    ) -> Result<(), Error> {
         self.inner.switch_voltage(voltage)
     }
 
@@ -417,8 +420,7 @@ mod tests {
     #[test]
     fn rejects_64bit_bus_address() {
         let mut table = empty_table();
-        let err =
-            build_descriptors(&mut table, 0x1_0000_0000, 512, Phase::DataRead).unwrap_err();
+        let err = build_descriptors(&mut table, 0x1_0000_0000, 512, Phase::DataRead).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 

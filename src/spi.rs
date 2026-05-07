@@ -10,13 +10,12 @@ use embedded_hal::spi::SpiDevice;
 
 use crate::cmd::Command;
 use crate::common::{block_addr_of, crc16_ccitt};
-#[allow(unused_imports)]
-use crate::diag::{debug, info, trace, warn_};
 use crate::error::{Error, ErrorContext, Phase};
 use crate::response::{
     CidResponse, CsdResponse, IfCondResponse, OcrResponse, R1Response, Response, ResponseType,
     SwitchStatus,
 };
+use log::{debug, info, warn};
 
 /// Token markers for SPI mode data transfer
 const TOKEN_START_BLOCK: u8 = 0xFE;
@@ -190,7 +189,7 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
             }
 
             if elapsed >= Self::INIT_TIMEOUT_US {
-                warn_!("spi: ACMD41 timed out after {}us", elapsed);
+                warn!("spi: ACMD41 timed out after {}us", elapsed);
                 return Err(Error::Timeout(ErrorContext::for_cmd(Phase::Init, 41)));
             }
             self.delay.delay_us(1_000);
@@ -415,10 +414,9 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
             let received = u16::from_be_bytes([crc_high, crc_low]);
             let computed = crc16_ccitt(buf);
             if received != computed {
-                warn_!(
+                warn!(
                     "spi: data CRC mismatch (received={:#x} computed={:#x})",
-                    received,
-                    computed
+                    received, computed
                 );
                 return Err(Error::Crc(ErrorContext::new(Phase::DataRead)));
             }
@@ -499,7 +497,7 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
         if active {
             info!("spi: switched to high-speed mode");
         } else {
-            warn_!("spi: high-speed switch did not take effect");
+            warn!("spi: high-speed switch did not take effect");
         }
         Ok(active)
     }
@@ -507,7 +505,6 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
 
 /// Card information obtained during initialization
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CardInfo {
     pub sd_v2: bool,
     pub high_capacity: bool,

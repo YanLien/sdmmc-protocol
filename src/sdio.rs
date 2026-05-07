@@ -9,17 +9,16 @@ use embedded_hal::delay::DelayNs;
 use crate::cmd::Command;
 use crate::common::block_addr_of;
 #[allow(unused_imports)]
-use crate::diag::{debug, info, trace, warn_};
 use crate::error::{Error, ErrorContext, Phase};
 use crate::response::{
     CardState, CidResponse, CsdResponse, OcrResponse, Response, ResponseType, SwitchStatus,
 };
+use log::{debug, info, warn};
 
 pub use crate::cmd::DataDirection;
 
 /// SDIO bus width
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum BusWidth {
     /// 1-bit bus
     Bit1,
@@ -32,7 +31,6 @@ pub enum BusWidth {
 
 /// SDIO clock speed
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ClockSpeed {
     /// Default speed: up to 25 MHz
     Default,
@@ -57,7 +55,6 @@ pub enum ClockSpeed {
 /// Bus signaling voltage. Default-speed and HS modes use 3.3 V; UHS-I
 /// and HS200/HS400 require switching to 1.8 V via CMD11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SignalVoltage {
     /// 3.3 V (or 3.0 V — they share an IO domain on most controllers).
     /// The bus comes up here at power-on.
@@ -292,8 +289,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
                 // than failing init, so a card on a PIO-only controller
                 // still comes up at default speed.
                 let dt = csd.device_type();
-                let want_hs200 =
-                    dt.supports_hs200() && self.try_hs200(self.bus_width).is_ok();
+                let want_hs200 = dt.supports_hs200() && self.try_hs200(self.bus_width).is_ok();
                 if !want_hs200 && dt.supports_hs_52() {
                     // EXT_CSD.HS_TIMING = 1 (high speed)
                     if let Err(_e) =
@@ -362,7 +358,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             }
 
             if elapsed >= Self::INIT_TIMEOUT_MS {
-                warn_!("sdio: ACMD41 timed out after {}ms", elapsed);
+                warn!("sdio: ACMD41 timed out after {}ms", elapsed);
                 return Err(Error::Timeout(ErrorContext::for_cmd(Phase::Init, 41)));
             }
             self.delay.delay_ms(Self::INIT_POLL_MS);
@@ -391,7 +387,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             }
 
             if elapsed >= Self::INIT_TIMEOUT_MS {
-                warn_!("sdio: CMD1 timed out after {}ms", elapsed);
+                warn!("sdio: CMD1 timed out after {}ms", elapsed);
                 return Err(Error::Timeout(ErrorContext::for_cmd(Phase::Init, 1)));
             }
             self.delay.delay_ms(Self::INIT_POLL_MS);
@@ -457,7 +453,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             let r = self.host.send_command(&crate::cmd::cmd13(self.rca))?;
             if let Response::R1(r1) = r {
                 if r1.switch_error() {
-                    warn_!("sdio: SWITCH_ERROR after CMD6 idx={} val={}", index, value);
+                    warn!("sdio: SWITCH_ERROR after CMD6 idx={} val={}", index, value);
                     return Err(Error::CardError(crate::error::CardError::IllegalCommand));
                 }
                 if r1.ready_for_data()
@@ -730,7 +726,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
         if active {
             info!("sdio: switched to high-speed mode");
         } else {
-            warn_!("sdio: high-speed switch did not take effect");
+            warn!("sdio: high-speed switch did not take effect");
         }
         Ok(active)
     }
@@ -738,7 +734,6 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
 
 /// Card information obtained during SDIO initialization
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CardInfo {
     /// Which physical-layer protocol the card speaks. SD vs eMMC matters
     /// for follow-up steps the protocol layer can't generalize over —
@@ -771,7 +766,6 @@ pub struct CardInfo {
 /// - CMD8 has no response and ACMD41 also fails, but CMD1 reports
 ///   power-up → eMMC / MMC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CardKind {
     /// SD memory card (SDSC / SDHC / SDXC).
     Sd,
@@ -992,7 +986,10 @@ mod tests {
     }
 
     fn acmd41_timeout() -> Result<Response, Error> {
-        Err(Error::Timeout(ErrorContext::for_cmd(Phase::CommandSend, 41)))
+        Err(Error::Timeout(ErrorContext::for_cmd(
+            Phase::CommandSend,
+            41,
+        )))
     }
 
     /// CMD13 R1 with `READY_FOR_DATA` set and the card in `tran` state.
@@ -1100,16 +1097,18 @@ mod tests {
             // driver retries with Bit4. No additional CMD6 needed for
             // the current implementation? Actually, yes — set_bus_width_mmc
             // re-issues CMD6 with BUS_WIDTH=1 first.
-            Ok(ok_r1()),                // CMD6 SWITCH (4-bit)
-            Ok(r1_tran_ready()),        // CMD13 — tran
-            Ok(ok_r1()),                // CMD6 SWITCH (HS_TIMING=1)
-            Ok(r1_tran_ready()),        // CMD13 — tran
+            Ok(ok_r1()),         // CMD6 SWITCH (4-bit)
+            Ok(r1_tran_ready()), // CMD13 — tran
+            Ok(ok_r1()),         // CMD6 SWITCH (HS_TIMING=1)
+            Ok(r1_tran_ready()), // CMD13 — tran
         ];
         let mut host = MockHost::with_results(replies);
         host.next_read_payload = Some(ext_csd_blob());
         host.reject_bit8 = true;
         let mut driver = SdioSdmmc::new(host, NullDelay);
-        let _info = driver.init().expect("eMMC init succeeds with 4-bit fallback");
+        let _info = driver
+            .init()
+            .expect("eMMC init succeeds with 4-bit fallback");
 
         assert_eq!(driver.host.bus_width, Some(BusWidth::Bit4));
     }
@@ -1120,17 +1119,17 @@ mod tests {
         // *do* answer ACMD41. The driver must not promote them to MMC
         // just because CMD8 timed out.
         let replies = std::vec![
-            Ok(ok_r1()),                                // CMD0
-            cmd8_timeout(),                             // CMD8 — SD v1 no echo
-            Ok(ok_r1()),                                // CMD55 (ACMD41 prologue)
+            Ok(ok_r1()),    // CMD0
+            cmd8_timeout(), // CMD8 — SD v1 no echo
+            Ok(ok_r1()),    // CMD55 (ACMD41 prologue)
             // bit 31 set, bit 30 clear → SDSC, ready
             Ok(Response::R3(OcrResponse::from_raw(0x80FF_8000))),
-            Ok(cid_response()),                         // CMD2
-            Ok(rca_response(0x4321)),                   // CMD3 (R6, card picks)
-            Ok(csd_v2_response()),                      // CMD9
-            Ok(ok_r1()),                                // CMD7
-            Ok(ok_r1()),                                // CMD55 (ACMD6 prologue)
-            Ok(ok_r1()),                                // ACMD6
+            Ok(cid_response()),       // CMD2
+            Ok(rca_response(0x4321)), // CMD3 (R6, card picks)
+            Ok(csd_v2_response()),    // CMD9
+            Ok(ok_r1()),              // CMD7
+            Ok(ok_r1()),              // CMD55 (ACMD6 prologue)
+            Ok(ok_r1()),              // ACMD6
         ];
         let host = MockHost::with_results(replies);
         let mut driver = SdioSdmmc::new(host, NullDelay);
@@ -1219,16 +1218,15 @@ mod tests {
             Ok(ok_r1()),                // CMD6 BUS_WIDTH=8
             Ok(r1_tran_ready()),        // CMD13
             // try_hs200 attempts HS_TIMING=2 + tuning, then fails:
-            Ok(ok_r1()),                // CMD6 HS_TIMING=2
-            Ok(r1_tran_ready()),        // CMD13 (post-switch)
+            Ok(ok_r1()),         // CMD6 HS_TIMING=2
+            Ok(r1_tran_ready()), // CMD13 (post-switch)
             // tuning fails — driver falls through to HS @ 52 MHz:
-            Ok(ok_r1()),                // CMD6 HS_TIMING=1
-            Ok(r1_tran_ready()),        // CMD13 (post-switch)
+            Ok(ok_r1()),         // CMD6 HS_TIMING=1
+            Ok(r1_tran_ready()), // CMD13 (post-switch)
         ];
         let mut host = MockHost::with_results(replies);
         host.next_read_payload = Some(ext_csd_blob_hs200());
-        host.tuning_result =
-            Some(Error::BadResponse(ErrorContext::for_cmd(Phase::Init, 21)));
+        host.tuning_result = Some(Error::BadResponse(ErrorContext::for_cmd(Phase::Init, 21)));
         let mut driver = SdioSdmmc::new(host, NullDelay);
         let _info = driver
             .init()

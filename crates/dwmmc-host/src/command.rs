@@ -7,8 +7,8 @@
 use sdmmc_protocol::cmd::{Command as ProtoCmd, DataDirection};
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 use sdmmc_protocol::response::{
-    IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType,
-    SdioOcrResponse, SdioRwResponse,
+    IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType, SdioOcrResponse,
+    SdioRwResponse,
 };
 
 use crate::host::DwMmc;
@@ -78,11 +78,7 @@ impl DwMmc {
     /// Block until [`crate::regs::RIntSts::data_transfer_over`] fires (or
     /// an error). Used by [`crate::data`] after the last block has been
     /// drained / pushed.
-    pub(crate) fn wait_data_transfer_over(
-        &self,
-        cmd_index: u8,
-        phase: Phase,
-    ) -> Result<(), Error> {
+    pub(crate) fn wait_data_transfer_over(&self, cmd_index: u8, phase: Phase) -> Result<(), Error> {
         for _ in 0..POLL_LIMIT {
             let s = self.regs.rintsts().read();
             if s.error() {
@@ -154,18 +150,14 @@ fn encode_command(cmd: &ProtoCmd, data_dir: Option<DataDirection>) -> Cmd {
             // No response_expect; no CRC check.
         }
         ResponseType::R1 | ResponseType::R5 | ResponseType::R6 | ResponseType::R7 => {
-            c = c
-                .with_response_expect(true)
-                .with_check_response_crc(true);
+            c = c.with_response_expect(true).with_check_response_crc(true);
         }
         ResponseType::R1b => {
             // R1b is short response with busy. The DW_mshc treats the
             // busy hold-off through the same CMD bits as R1 plus the
             // controller's own data-busy gating; no separate
             // "response_length_busy" flag exists.
-            c = c
-                .with_response_expect(true)
-                .with_check_response_crc(true);
+            c = c.with_response_expect(true).with_check_response_crc(true);
         }
         ResponseType::R2 => {
             // R2 = long (136-bit) response. CRC of the on-bus frame is

@@ -64,7 +64,7 @@ mod dma;
 mod host;
 mod regs;
 
-pub use dma::{Adma2Buffer, Dma, DmaDir, SdhciAdma2, ADMA2_DESC_COUNT};
+pub use dma::{ADMA2_DESC_COUNT, Adma2Buffer, Dma, DmaDir, SdhciAdma2};
 pub use host::Sdhci;
 
 use sdmmc_protocol::cmd::{Command, DataDirection};
@@ -218,13 +218,12 @@ impl SdioHost for Sdhci {
         // MMC CMD21 is 64 (4-bit) or 128 (8-bit). The host doesn't
         // know the bus width here without snooping HOST_CONTROL1; we
         // read it back to pick the right size.
-        let block_size: u16 = if cmd_index == 21
-            && self.read_u8(REG_HOST_CONTROL1) & HOST_CTRL1_8BIT != 0
-        {
-            128
-        } else {
-            64
-        };
+        let block_size: u16 =
+            if cmd_index == 21 && self.read_u8(REG_HOST_CONTROL1) & HOST_CTRL1_8BIT != 0 {
+                128
+            } else {
+                64
+            };
 
         // Pre-program the data registers per SDHCI v3 §3.7.7. The
         // controller issues the tuning command itself; we just hand it
@@ -233,7 +232,10 @@ impl SdioHost for Sdhci {
         self.write_u16(REG_BLOCK_COUNT, 1);
         self.write_u8(REG_TIMEOUT_CONTROL, 0x0E);
         // Direction = read, single block, DMA disabled.
-        self.write_u16(REG_TRANSFER_MODE, XFER_MODE_BLOCK_COUNT_ENABLE | XFER_MODE_READ);
+        self.write_u16(
+            REG_TRANSFER_MODE,
+            XFER_MODE_BLOCK_COUNT_ENABLE | XFER_MODE_READ,
+        );
 
         // 1. Set the Execute Tuning bit. The controller takes over and
         //    issues the tuning command repeatedly while sweeping its
@@ -269,6 +271,9 @@ impl SdioHost for Sdhci {
         // the next attempt starts clean, and surface a timeout.
         let cleared = last_status & !HOST_CTRL2_EXECUTE_TUNING;
         self.write_u16(REG_HOST_CONTROL2, cleared);
-        Err(Error::Timeout(ErrorContext::for_cmd(Phase::Init, cmd_index)))
+        Err(Error::Timeout(ErrorContext::for_cmd(
+            Phase::Init,
+            cmd_index,
+        )))
     }
 }

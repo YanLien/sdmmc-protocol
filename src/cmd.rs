@@ -2,7 +2,6 @@ use crate::response::ResponseType;
 
 /// Direction of the data phase that follows a command, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DataDirection {
     /// No data phase follows this command.
     None,
@@ -21,7 +20,6 @@ impl DataDirection {
 
 /// SD/MMC command definitions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Command {
     pub cmd: u8,
     pub arg: u32,

@@ -48,7 +48,7 @@ mod data;
 mod host;
 mod regs;
 
-pub use crate::host::{DwMmc, DEFAULT_FIFO_OFFSET};
+pub use crate::host::{DEFAULT_FIFO_OFFSET, DwMmc};
 
 use sdmmc_protocol::cmd::{Command, DataDirection};
 use sdmmc_protocol::error::Error;

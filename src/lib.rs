@@ -26,11 +26,9 @@
 //! |----------|---------|-------------------------------------------------|
 //! | `spi`    | yes     | Enables [`spi::SpiTransport`] and [`spi::SpiSdmmc`]. |
 //! | `sdio`   | no      | Enables [`sdio::SdioHost`] and [`sdio::SdioSdmmc`].  |
-//! | `defmt`  | no      | Derives `defmt::Format` on public protocol types.    |
-//! | `log`    | no      | Routes the internal diagnostic shim to `log`.        |
 //!
-//! When both `defmt` and `log` are enabled, `defmt` wins for diagnostic
-//! output. When neither is enabled the diagnostic macros expand to nothing.
+//! Diagnostic output goes through the [`log`] crate; configure a logger in
+//! your application to capture it.
 //!
 //! # Example
 //!
@@ -71,7 +69,6 @@
 
 pub mod cmd;
 mod common;
-mod diag;
 pub mod error;
 pub mod ext_csd;
 pub mod response;

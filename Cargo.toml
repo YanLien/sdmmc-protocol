@@ -2,8 +2,7 @@
 name = "sdmmc-protocol"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "no_std SD/MMC protocol building blocks for embedded systems"
 repository = "https://github.com/YanLien/sdmmc-protocol"
 documentation = "https://docs.rs/sdmmc-protocol"
@@ -14,17 +13,13 @@ categories = ["embedded", "no-std", "hardware-support"]
 [dependencies]
 bitflags = "2"
 embedded-hal = "1"
-log = { version = "0.4", optional = true }
-defmt = { version = "0.3", optional = true }
+log = "0.4"
 
 [features]
 default = ["spi"]
 spi = []
 sdio = []
-defmt = ["dep:defmt"]
-log = ["dep:log"]
 
 [workspace]
 members = [".", "crates/sdhci-host", "crates/dwmmc-host"]
 resolver = "3"
-

@@ -68,11 +68,7 @@ impl Sdhci {
 
     /// Same as [`wait_data_complete`] but also surfaces ADMA-engine
     /// errors. Used by the DMA data path.
-    pub fn wait_data_complete_with_adma(
-        &self,
-        cmd_index: u8,
-        phase: Phase,
-    ) -> Result<(), Error> {
+    pub fn wait_data_complete_with_adma(&self, cmd_index: u8, phase: Phase) -> Result<(), Error> {
         for _ in 0..POLL_LIMIT {
             let status = self.read_u16(REG_NORMAL_INT_STATUS);
             if status & NORMAL_INT_XFER_COMPLETE != 0 {

@@ -15,8 +15,7 @@ use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 use volatile::VolatilePtr;
 
 use crate::regs::{
-    BlkSiz, CType, ClkDiv, ClkEna, Cmd, RIntSts, RegisterBlock,
-    RegisterBlockVolatileFieldAccess,
+    BlkSiz, CType, ClkDiv, ClkEna, Cmd, RIntSts, RegisterBlock, RegisterBlockVolatileFieldAccess,
 };
 
 /// Default FIFO offset used by Rockchip DWC_mobile_storage variants
@@ -246,9 +245,7 @@ impl DwMmc {
     /// Reset just the FIFO pointers. Useful after a data-phase error
     /// so the next transfer starts from a clean state.
     pub fn reset_fifo(&self) -> Result<(), Error> {
-        self.regs
-            .ctrl()
-            .update(|r| r.with_fifo_reset(true));
+        self.regs.ctrl().update(|r| r.with_fifo_reset(true));
         for _ in 0..1_000_000 {
             if !self.regs.ctrl().read().fifo_reset() {
                 return Ok(());
@@ -261,12 +258,7 @@ impl DwMmc {
     /// Translate a non-zero `RIntSts.error()` into our protocol error
     /// type. `phase` and `cmd_index` give the caller's pipeline
     /// context.
-    pub(crate) fn translate_int_error(
-        &self,
-        ints: RIntSts,
-        phase: Phase,
-        cmd_index: u8,
-    ) -> Error {
+    pub(crate) fn translate_int_error(&self, ints: RIntSts, phase: Phase, cmd_index: u8) -> Error {
         let ctx = ErrorContext::for_cmd(phase, cmd_index);
         if ints.response_timeout() || ints.data_read_timeout() || ints.host_timeout() {
             Error::Timeout(ctx)
