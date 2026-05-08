@@ -64,7 +64,7 @@ pub(crate) const NORMAL_INT_BUFFER_READ_READY: u16 = 1 << 5;
 pub(crate) const NORMAL_INT_CARD_INSERTION: u16 = 1 << 6;
 pub(crate) const NORMAL_INT_CARD_REMOVAL: u16 = 1 << 7;
 pub(crate) const NORMAL_INT_ERROR: u16 = 1 << 15;
-pub(crate) const NORMAL_INT_CLEAR_ALL: u16 = 0x7FFF;
+pub(crate) const NORMAL_INT_CLEAR_ALL: u16 = 0xFFFF;
 
 // ── Error Interrupt Status ─────────────────────────────────────────────
 

@@ -6,20 +6,19 @@
 
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 
-use crate::host::Sdhci;
-use crate::regs::*;
+use crate::{host::Sdhci, regs::*};
 
 const POLL_LIMIT: u32 = 1_000_000;
 
 impl Sdhci {
     pub(crate) fn pio_read(
-        &self,
+        &mut self,
         buf: &mut [u8],
         block_size: u32,
         cmd_index: u8,
     ) -> Result<(), Error> {
         let block_size = block_size as usize;
-        if buf.len() % block_size != 0 {
+        if !buf.len().is_multiple_of(block_size) {
             return Err(Error::Misaligned);
         }
 
@@ -38,13 +37,13 @@ impl Sdhci {
     }
 
     pub(crate) fn pio_write(
-        &self,
+        &mut self,
         buf: &[u8],
         block_size: u32,
         cmd_index: u8,
     ) -> Result<(), Error> {
         let block_size = block_size as usize;
-        if buf.len() % block_size != 0 {
+        if !buf.len().is_multiple_of(block_size) {
             return Err(Error::Misaligned);
         }
 
@@ -63,7 +62,7 @@ impl Sdhci {
         self.wait_data_complete(cmd_index)
     }
 
-    fn wait_buffer_ready(&self, read: bool, cmd_index: u8) -> Result<(), Error> {
+    fn wait_buffer_ready(&mut self, read: bool, cmd_index: u8) -> Result<(), Error> {
         let success = if read {
             NORMAL_INT_BUFFER_READ_READY
         } else {
@@ -81,8 +80,12 @@ impl Sdhci {
                 return Ok(());
             }
             if status & NORMAL_INT_ERROR != 0 {
+                self.log_status("data buffer error", cmd_index);
                 let err = self.read_u16(REG_ERROR_INT_STATUS);
+                self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
                 self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+                let _ = self.reset_cmd();
+                let _ = self.reset_dat();
                 let ctx = ErrorContext::for_cmd(phase, cmd_index);
                 return Err(
                     if err & (ERROR_INT_DATA_TIMEOUT | ERROR_INT_CMD_TIMEOUT) != 0 {
@@ -98,6 +101,11 @@ impl Sdhci {
             }
             core::hint::spin_loop();
         }
+        self.log_status("data buffer wait timed out", cmd_index);
+        self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+        self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+        let _ = self.reset_cmd();
+        let _ = self.reset_dat();
         Err(Error::Timeout(ErrorContext::for_cmd(phase, cmd_index)))
     }
 }

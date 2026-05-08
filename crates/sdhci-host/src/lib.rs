@@ -66,14 +66,14 @@ mod regs;
 
 pub use dma::{ADMA2_DESC_COUNT, Adma2Buffer, Dma, DmaDir, SdhciAdma2};
 pub use host::Sdhci;
+use sdmmc_protocol::{
+    cmd::{Command, DataDirection},
+    error::{Error, ErrorContext, Phase},
+    response::Response,
+    sdio::{BusWidth, ClockSpeed, SdioHost, SignalVoltage},
+};
 
-use sdmmc_protocol::cmd::{Command, DataDirection};
-use sdmmc_protocol::error::{Error, ErrorContext, Phase};
-use sdmmc_protocol::response::Response;
-use sdmmc_protocol::sdio::{BusWidth, ClockSpeed, SdioHost, SignalVoltage};
-
-use crate::host::PendingData;
-use crate::regs::*;
+use crate::{host::PendingData, regs::*};
 
 impl SdioHost for Sdhci {
     fn send_command(&mut self, cmd: &Command) -> Result<Response, Error> {
@@ -81,11 +81,11 @@ impl SdioHost for Sdhci {
     }
 
     fn read_data(&mut self, buf: &mut [u8], block_size: u32) -> Result<(), Error> {
-        self.pio_read(buf, block_size, 0)
+        self.pio_read(buf, block_size, self.active_data_cmd)
     }
 
     fn write_data(&mut self, buf: &[u8], block_size: u32) -> Result<(), Error> {
-        self.pio_write(buf, block_size, 0)
+        self.pio_write(buf, block_size, self.active_data_cmd)
     }
 
     fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error> {
@@ -106,6 +106,7 @@ impl SdioHost for Sdhci {
 
     fn set_clock(&mut self, speed: ClockSpeed) -> Result<(), Error> {
         let target_hz = match speed {
+            ClockSpeed::Identification => 400_000,
             ClockSpeed::Default | ClockSpeed::Sdr12 => 25_000_000,
             ClockSpeed::HighSpeed | ClockSpeed::Sdr25 => 50_000_000,
             ClockSpeed::Sdr50 | ClockSpeed::Ddr50 => 50_000_000,
@@ -117,7 +118,10 @@ impl SdioHost for Sdhci {
         // divider change so the controller pipelines reflect the new
         // timing window.
         let mut ctrl = self.read_u8(REG_HOST_CONTROL1);
-        if matches!(speed, ClockSpeed::Default | ClockSpeed::Sdr12) {
+        if matches!(
+            speed,
+            ClockSpeed::Identification | ClockSpeed::Default | ClockSpeed::Sdr12
+        ) {
             ctrl &= !HOST_CTRL1_HIGH_SPEED;
         } else {
             ctrl |= HOST_CTRL1_HIGH_SPEED;

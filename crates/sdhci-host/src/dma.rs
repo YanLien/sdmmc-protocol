@@ -22,10 +22,12 @@
 
 use core::cell::RefCell;
 
-use sdmmc_protocol::cmd::{Command, DataDirection};
-use sdmmc_protocol::error::{Error, ErrorContext, Phase};
-use sdmmc_protocol::response::Response;
-use sdmmc_protocol::sdio::{BusWidth, ClockSpeed, SdioHost};
+use sdmmc_protocol::{
+    cmd::{Command, DataDirection},
+    error::{Error, ErrorContext, Phase},
+    response::Response,
+    sdio::{BusWidth, ClockSpeed, SdioHost},
+};
 
 use crate::host::{PendingData, Sdhci};
 
@@ -282,18 +284,13 @@ impl<'buf, D: Dma> SdhciAdma2<'buf, D> {
     }
 }
 
-/// Last command index issued; tagged onto error contexts. We don't
-/// snoop the actual command index here because `issue_command` is
-/// already done by the time the DMA engine fires.
-const DMA_PHASE_CMD: u8 = 0;
-
 impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
     fn send_command(&mut self, cmd: &Command) -> Result<Response, Error> {
         self.inner.issue_command(cmd)
     }
 
     fn read_data(&mut self, buf: &mut [u8], block_size: u32) -> Result<(), Error> {
-        if block_size == 0 || (buf.len() as u32) % block_size != 0 {
+        if block_size == 0 || !(buf.len() as u32).is_multiple_of(block_size) {
             return Err(Error::Misaligned);
         }
         if buf.as_ptr() as usize & 0x3 != 0 {
@@ -307,7 +304,7 @@ impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
         // controller's transfer-complete IRQ status flag (or an ADMA
         // error).
         self.inner
-            .wait_data_complete_with_adma(DMA_PHASE_CMD, Phase::DataRead)?;
+            .wait_data_complete_with_adma(self.inner.active_data_cmd, Phase::DataRead)?;
 
         // Flush/invalidate cache so the CPU sees what the device wrote.
         self.dma.after_dma(ptr, len, DmaDir::FromDevice);
@@ -315,7 +312,7 @@ impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
     }
 
     fn write_data(&mut self, buf: &[u8], block_size: u32) -> Result<(), Error> {
-        if block_size == 0 || (buf.len() as u32) % block_size != 0 {
+        if block_size == 0 || !(buf.len() as u32).is_multiple_of(block_size) {
             return Err(Error::Misaligned);
         }
         if buf.as_ptr() as usize & 0x3 != 0 {
@@ -325,7 +322,7 @@ impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
         let ptr = buf.as_ptr();
         self.run_dma(ptr, len, DmaDir::ToDevice)?;
         self.inner
-            .wait_data_complete_with_adma(DMA_PHASE_CMD, Phase::DataWrite)?;
+            .wait_data_complete_with_adma(self.inner.active_data_cmd, Phase::DataWrite)?;
         self.dma.after_dma(ptr, len, DmaDir::ToDevice);
         Ok(())
     }

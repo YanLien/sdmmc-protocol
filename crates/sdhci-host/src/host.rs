@@ -37,6 +37,9 @@ pub struct Sdhci {
     /// for 1:1 passthrough) instead of using the internal 10-bit divider.
     /// Used on controllers whose internal divider is unusable.
     pub(crate) ext_clock: Option<fn(target_hz: u32) -> Result<(), Error>>,
+    /// Command index for the data phase currently being drained by
+    /// `read_data` / `write_data`.
+    pub(crate) active_data_cmd: u8,
 }
 
 impl Sdhci {
@@ -52,6 +55,7 @@ impl Sdhci {
             pending_data: None,
             use_dma: false,
             ext_clock: None,
+            active_data_cmd: 0,
         }
     }
 

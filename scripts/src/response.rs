@@ -238,11 +238,6 @@ impl OcrResponse {
     pub fn uhs2(&self) -> bool {
         self.raw & (1 << 29) != 0
     }
-
-    /// Switching to 1.8 V was accepted during SD ACMD41 negotiation.
-    pub fn s18a(&self) -> bool {
-        self.raw & (1 << 24) != 0
-    }
 }
 
 /// R6: Published RCA response
@@ -448,14 +443,6 @@ impl SwitchStatus {
     /// Returns true iff group 1 reports high-speed (function 1) selected.
     pub fn high_speed_active(&self) -> bool {
         self.selected_function(1) == 1
-    }
-
-    /// Returns true iff SD access-mode group 1 advertises `function`.
-    ///
-    /// The support bitmap for group 1 is carried in byte 13 in the 64-byte
-    /// switch status block; bit `n` means function `n` is selectable.
-    pub fn access_mode_supported(&self, function: u8) -> bool {
-        function < 8 && (self.raw[13] & (1 << function)) != 0
     }
 }
 
@@ -732,18 +719,6 @@ mod tests {
         let status = SwitchStatus::from_raw(raw);
         assert_eq!(status.selected_function(1), 1);
         assert!(status.high_speed_active());
-    }
-
-    #[test]
-    fn switch_status_reports_access_mode_support_bits() {
-        let mut raw = [0u8; 64];
-        raw[13] = (1 << 1) | (1 << 3);
-        let status = SwitchStatus::from_raw(raw);
-
-        assert!(status.access_mode_supported(1));
-        assert!(status.access_mode_supported(3));
-        assert!(!status.access_mode_supported(2));
-        assert!(!status.access_mode_supported(8));
     }
 
     #[test]

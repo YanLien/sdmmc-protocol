@@ -11,11 +11,19 @@
 
 use core::ptr::NonNull;
 
-use sdmmc_protocol::error::{Error, ErrorContext, Phase};
+use sdmmc_protocol::{
+    error::{Error, ErrorContext, Phase},
+    sdio::{ClockSpeed, SignalVoltage},
+};
 use volatile::VolatilePtr;
 
-use crate::regs::{
-    BlkSiz, CType, ClkDiv, ClkEna, Cmd, RIntSts, RegisterBlock, RegisterBlockVolatileFieldAccess,
+use crate::{
+    UhsBits,
+    regs::{
+        BlkSiz, CType, ClkDiv, ClkEna, Cmd, RIntSts, RegisterBlock,
+        RegisterBlockVolatileFieldAccess,
+    },
+    uhs_bits_after_speed, uhs_bits_after_voltage,
 };
 
 /// Default FIFO offset used by Rockchip DWC_mobile_storage variants
@@ -50,6 +58,8 @@ pub struct DwMmc {
     pub(crate) fifo_offset: usize,
     pub(crate) ref_clock_hz: u32,
     pub(crate) pending_data: Option<PendingData>,
+    pub(crate) data_blocks_remaining: u32,
+    pub(crate) data_cmd_index: u8,
 }
 
 impl DwMmc {
@@ -82,6 +92,8 @@ impl DwMmc {
             fifo_offset,
             ref_clock_hz: 0,
             pending_data: None,
+            data_blocks_remaining: 0,
+            data_cmd_index: 0,
         }
     }
 
@@ -135,6 +147,7 @@ impl DwMmc {
 
         // Default to 1-bit bus until the protocol layer asks for wider.
         self.regs.ctype().write(CType::new());
+        self.regs.uhs().write(crate::regs::UHS::new());
 
         // Program the divider for 400 kHz (the SD spec ID-mode rate).
         self.program_clock(400_000)?;
@@ -174,7 +187,8 @@ impl DwMmc {
 
         // 2. Compute a divider. CLKDIV value `n` divides the
         //    reference by `2 * n` (n = 0 means bypass / 1:1).
-        let div: u8 = if self.ref_clock_hz == 0 || target_hz == 0 {
+        let div: u8 = if self.ref_clock_hz == 0 || target_hz == 0 || target_hz >= self.ref_clock_hz
+        {
             0
         } else {
             let raw = self.ref_clock_hz.div_ceil(2 * target_hz);
@@ -232,6 +246,37 @@ impl DwMmc {
             BusWidth::Bit8 => CType::new().with_width8(1),
         };
         self.regs.ctype().write(ct);
+    }
+
+    /// Program DW_mshc UHS timing bits for card 0. The generic DW_mshc
+    /// UHS register exposes DDR and signaling-voltage selectors; SoC-specific
+    /// sample/drive delay lines remain platform glue responsibility.
+    pub(crate) fn set_uhs_timing(&mut self, speed: ClockSpeed) {
+        let cur = self.uhs_bits();
+        self.write_uhs_bits(uhs_bits_after_speed(cur, speed));
+    }
+
+    /// Program DW_mshc signaling-voltage bit for card 0.
+    pub(crate) fn set_signal_voltage(&mut self, voltage: SignalVoltage) -> Result<(), Error> {
+        let cur = self.uhs_bits();
+        self.write_uhs_bits(uhs_bits_after_voltage(cur, voltage)?);
+        Ok(())
+    }
+
+    fn uhs_bits(&self) -> UhsBits {
+        let uhs = self.regs.uhs().read();
+        UhsBits {
+            ddr: uhs.ddr(),
+            volt: uhs.volt(),
+        }
+    }
+
+    fn write_uhs_bits(&self, bits: UhsBits) {
+        self.regs.uhs().write(
+            crate::regs::UHS::new()
+                .with_ddr(bits.ddr)
+                .with_volt(bits.volt),
+        );
     }
 
     /// Program block size + total byte count for the next data phase.

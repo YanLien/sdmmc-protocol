@@ -7,14 +7,13 @@
 //! All raise sites tag their phase with [`Phase::CommandSend`] /
 //! [`Phase::ResponseWait`] so callers can pinpoint failures.
 
-use sdmmc_protocol::cmd::Command;
-use sdmmc_protocol::error::{Error, ErrorContext, Phase};
-use sdmmc_protocol::response::{
-    IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType,
+use sdmmc_protocol::{
+    cmd::Command,
+    error::{Error, ErrorContext, Phase},
+    response::{IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType},
 };
 
-use crate::host::Sdhci;
-use crate::regs::*;
+use crate::{host::Sdhci, regs::*};
 
 const POLL_LIMIT: u32 = 1_000_000;
 
@@ -24,9 +23,11 @@ impl Sdhci {
     /// command carries a data phase.
     pub fn issue_command(&mut self, cmd: &Command) -> Result<Response, Error> {
         let data = self.pending_data.take();
+        let has_data = data.is_some();
+        info_command_start(self, cmd, data);
 
         // 1. Wait for the controller's own pipeline to drain.
-        self.wait_inhibit(data.is_some(), cmd.cmd)?;
+        self.wait_inhibit(has_data, cmd.cmd)?;
 
         // 2. Clear any leftover interrupt bits.
         self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
@@ -41,28 +42,51 @@ impl Sdhci {
 
         // 4. Push the argument and command-register encoding.
         self.write_u32(REG_ARGUMENT, cmd.arg);
-        let cmd_reg = encode_command(cmd, data.is_some())?;
+        let cmd_reg = encode_command(cmd, has_data)?;
         self.write_u16(REG_COMMAND, cmd_reg);
+        if has_data {
+            self.active_data_cmd = cmd.cmd;
+        }
+        self.log_status("issued", cmd.cmd);
 
         // 5. Block until the response arrives (or the controller flags
         //    a CMD-line error).
-        self.wait_for(NORMAL_INT_CMD_COMPLETE, ERROR_INT_CMD_LINE_MASK, cmd.cmd)?;
+        if let Err(err) = self.wait_for(NORMAL_INT_CMD_COMPLETE, ERROR_INT_CMD_LINE_MASK, cmd.cmd) {
+            self.log_status("command wait failed", cmd.cmd);
+            self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+            self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+            let _ = self.reset_cmd();
+            if has_data {
+                let _ = self.reset_dat();
+            }
+            return Err(err);
+        }
 
         // 6. Acknowledge command completion.
         self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CMD_COMPLETE);
 
-        decode_response(self, cmd.resp_type)
+        let response = decode_response(self, cmd.resp_type)?;
+        log::debug!("sdhci: CMD{} response {:?}", cmd.cmd, response);
+        Ok(response)
     }
 
     /// Block until the next data phase finishes (Transfer Complete) or
     /// the controller raises a DAT-line error.
-    pub fn wait_data_complete(&self, cmd_index: u8) -> Result<(), Error> {
-        self.wait_for(
+    pub fn wait_data_complete(&mut self, cmd_index: u8) -> Result<(), Error> {
+        if let Err(err) = self.wait_for(
             NORMAL_INT_XFER_COMPLETE,
             ERROR_INT_DATA_LINE_MASK,
             cmd_index,
-        )?;
+        ) {
+            self.log_status("data wait failed", cmd_index);
+            self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+            self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+            let _ = self.reset_cmd();
+            let _ = self.reset_dat();
+            return Err(err);
+        }
         self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_XFER_COMPLETE);
+        self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
         Ok(())
     }
 
@@ -110,6 +134,7 @@ impl Sdhci {
             }
             core::hint::spin_loop();
         }
+        self.log_status("inhibit wait timed out", cmd_index);
         Err(Error::Timeout(ErrorContext::for_cmd(
             Phase::CommandSend,
             cmd_index,
@@ -123,10 +148,12 @@ impl Sdhci {
                 return Ok(());
             }
             if status & NORMAL_INT_ERROR != 0 {
+                self.log_status("interrupt error", cmd_index);
                 return Err(self.translate_error(error_mask, cmd_index));
             }
             core::hint::spin_loop();
         }
+        self.log_status("interrupt wait timed out", cmd_index);
         Err(Error::Timeout(ErrorContext::for_cmd(
             Phase::ResponseWait,
             cmd_index,
@@ -146,6 +173,49 @@ impl Sdhci {
             Error::ReadError(ctx)
         } else {
             Error::BadResponse(ctx)
+        }
+    }
+
+    pub(crate) fn log_status(&self, reason: &str, cmd_index: u8) {
+        let present = self.read_u32(REG_PRESENT_STATE);
+        let normal = self.read_u16(REG_NORMAL_INT_STATUS);
+        let error = self.read_u16(REG_ERROR_INT_STATUS);
+        let clock = self.read_u16(REG_CLOCK_CONTROL);
+        let power = self.read_u8(REG_POWER_CONTROL);
+        let host1 = self.read_u8(REG_HOST_CONTROL1);
+        let host2 = self.read_u16(REG_HOST_CONTROL2);
+        let reset = self.read_u8(REG_SOFTWARE_RESET);
+
+        if reason == "issued" {
+            log::debug!(
+                "sdhci: {} CMD{} present={:#010x} normal={:#06x} error={:#06x} clock={:#06x} \
+                 power={:#04x} host1={:#04x} host2={:#06x} reset={:#04x}",
+                reason,
+                cmd_index,
+                present,
+                normal,
+                error,
+                clock,
+                power,
+                host1,
+                host2,
+                reset
+            );
+        } else {
+            log::info!(
+                "sdhci: {} CMD{} present={:#010x} normal={:#06x} error={:#06x} clock={:#06x} \
+                 power={:#04x} host1={:#04x} host2={:#06x} reset={:#04x}",
+                reason,
+                cmd_index,
+                present,
+                normal,
+                error,
+                clock,
+                power,
+                host1,
+                host2,
+                reset
+            );
         }
     }
 
@@ -178,6 +248,29 @@ impl Sdhci {
     }
 }
 
+fn info_command_start(host: &Sdhci, cmd: &Command, data: Option<crate::host::PendingData>) {
+    match data {
+        Some(data) => log::debug!(
+            "sdhci: CMD{} arg={:#010x} resp={:?} data={:?} blocks={} block_size={} \
+             present={:#010x}",
+            cmd.cmd,
+            cmd.arg,
+            cmd.resp_type,
+            data.direction,
+            data.block_count,
+            data.block_size,
+            host.read_u32(REG_PRESENT_STATE)
+        ),
+        None => log::debug!(
+            "sdhci: CMD{} arg={:#010x} resp={:?} data=none present={:#010x}",
+            cmd.cmd,
+            cmd.arg,
+            cmd.resp_type,
+            host.read_u32(REG_PRESENT_STATE)
+        ),
+    }
+}
+
 fn encode_command(cmd: &Command, has_data: bool) -> Result<u16, Error> {
     let resp_bits: u16 = match cmd.resp_type {
         ResponseType::None => CMD_RESP_NONE,
@@ -197,9 +290,9 @@ fn encode_command(cmd: &Command, has_data: bool) -> Result<u16, Error> {
 fn decode_response(host: &Sdhci, resp_type: ResponseType) -> Result<Response, Error> {
     Ok(match resp_type {
         ResponseType::None => Response::None,
-        ResponseType::R1 | ResponseType::R1b => {
-            Response::R1(R1Response::from_native_raw(host.response32(0))?)
-        }
+        ResponseType::R1 | ResponseType::R1b => Response::R1(R1Response {
+            raw: host.response32(0),
+        }),
         ResponseType::R2 => Response::R2(read_r2(host)),
         ResponseType::R3 => Response::R3(OcrResponse::from_raw(host.response32(0))),
         ResponseType::R4 | ResponseType::R5 => {

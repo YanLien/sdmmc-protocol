@@ -16,8 +16,7 @@
 
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 
-use crate::host::DwMmc;
-use crate::regs::RegisterBlockVolatileFieldAccess;
+use crate::{host::DwMmc, regs::RegisterBlockVolatileFieldAccess};
 
 const POLL_LIMIT: u32 = 8_000_000;
 
@@ -25,15 +24,20 @@ impl DwMmc {
     /// Drain `buf.len()` bytes from the FIFO. Caller must ensure
     /// `buf.len() % 8 == 0` (every callsite from the SDIO protocol
     /// layer uses 64-byte or 512-byte blocks, both multiples of 8).
-    pub(crate) fn pio_read(&mut self, buf: &mut [u8], cmd_index: u8) -> Result<(), Error> {
-        if buf.len() % 8 != 0 {
+    pub(crate) fn pio_read(
+        &mut self,
+        buf: &mut [u8],
+        cmd_index: u8,
+        wait_for_transfer_over: bool,
+    ) -> Result<(), Error> {
+        if !buf.len().is_multiple_of(8) {
             return Err(Error::Misaligned);
         }
         let fifo = self.fifo_ptr();
         let mut offset = 0usize;
         let mut idle_polls = 0u32;
 
-        while offset < buf.len() {
+        loop {
             let rintsts = self.regs.rintsts().read();
             if rintsts.error() {
                 let err = self.translate_int_error(rintsts, Phase::DataRead, cmd_index);
@@ -41,19 +45,25 @@ impl DwMmc {
                 return Err(err);
             }
 
-            // Drain whatever the FIFO currently holds. fifo_empty
-            // is the cheapest fast-path check; fifo_count would also
-            // work but adds another bitfield decode per word.
             let mut drained_any = false;
-            while !self.regs.status().read().fifo_empty() && offset < buf.len() {
-                let v = unsafe { fifo.read_volatile() };
-                buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
-                offset += 8;
-                drained_any = true;
+            let mut status = self.regs.status().read();
+            if rintsts.receive_fifo_data_request()
+                || status.fifo_count() >= 2
+                || (rintsts.data_transfer_over() && status.fifo_count() > 0)
+            {
+                while status.fifo_count() >= 2 {
+                    let v = unsafe { fifo.read_volatile() };
+                    if offset + 8 <= buf.len() {
+                        buf[offset..offset + 8].copy_from_slice(&v.to_le_bytes());
+                    }
+                    offset += 8;
+                    drained_any = true;
+                    status = self.regs.status().read();
+                }
             }
 
-            if offset == buf.len() {
-                return Ok(());
+            if offset >= buf.len() && (!wait_for_transfer_over || rintsts.data_transfer_over()) {
+                break;
             }
 
             if drained_any {
@@ -69,6 +79,12 @@ impl DwMmc {
                 core::hint::spin_loop();
             }
         }
+        if wait_for_transfer_over {
+            self.wait_data_transfer_over(cmd_index, Phase::DataRead)?;
+            let mut ack = crate::regs::RIntSts::new();
+            ack.set_data_transfer_over(true);
+            self.regs.rintsts().write(ack);
+        }
         Ok(())
     }
 
@@ -81,7 +97,7 @@ impl DwMmc {
     /// the bus has finished clocking the bytes out — racing the next
     /// command in past that boundary corrupts the write.
     pub(crate) fn pio_write(&mut self, buf: &[u8], cmd_index: u8) -> Result<(), Error> {
-        if buf.len() % 8 != 0 {
+        if !buf.len().is_multiple_of(8) {
             return Err(Error::Misaligned);
         }
         let fifo = self.fifo_ptr();

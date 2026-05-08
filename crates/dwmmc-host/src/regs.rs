@@ -12,8 +12,7 @@
 //! construction time (see [`crate::host::DwMmc::new_with_fifo_offset`]).
 
 use bitfield_struct::bitfield;
-use volatile::VolatileFieldAccess;
-use volatile::access::ReadOnly;
+use volatile::{VolatileFieldAccess, access::ReadOnly};
 
 /// DW_mshc register block (offsets 0x000..0x08C).
 ///

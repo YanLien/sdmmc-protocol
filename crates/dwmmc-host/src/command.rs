@@ -4,15 +4,19 @@
 //! value, fires it, polls RINTSTS for completion, and decodes the four
 //! 32-bit response slots back into [`Response`].
 
-use sdmmc_protocol::cmd::{Command as ProtoCmd, DataDirection};
-use sdmmc_protocol::error::{Error, ErrorContext, Phase};
-use sdmmc_protocol::response::{
-    IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType, SdioOcrResponse,
-    SdioRwResponse,
+use sdmmc_protocol::{
+    cmd::{Command as ProtoCmd, DataDirection},
+    error::{Error, ErrorContext, Phase},
+    response::{
+        IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType,
+        SdioOcrResponse, SdioRwResponse,
+    },
 };
 
-use crate::host::DwMmc;
-use crate::regs::{Cmd, RegisterBlockVolatileFieldAccess};
+use crate::{
+    host::DwMmc,
+    regs::{Cmd, RegisterBlockVolatileFieldAccess},
+};
 
 const POLL_LIMIT: u32 = 1_000_000;
 
@@ -26,6 +30,9 @@ impl DwMmc {
     /// the FIFO by `pio_read` / `pio_write`.
     pub fn issue_command(&mut self, cmd: &ProtoCmd) -> Result<Response, Error> {
         let data = self.pending_data.take();
+        if data.is_some() {
+            self.data_cmd_index = cmd.cmd;
+        }
 
         // 1. Wait for the CIU's command FSM to be idle. If a data
         //    phase is pending we also block on the data line, which
@@ -200,8 +207,8 @@ fn decode_response(host: &DwMmc, resp_type: ResponseType) -> Result<Response, Er
     let resp = host.regs.resp().read();
     Ok(match resp_type {
         ResponseType::None => Response::None,
-        ResponseType::R1 => Response::R1(R1Response::from_native_raw(resp[0])?),
-        ResponseType::R1b => Response::R1b(R1Response::from_native_raw(resp[0])?),
+        ResponseType::R1 => Response::R1(R1Response { raw: resp[0] }),
+        ResponseType::R1b => Response::R1b(R1Response { raw: resp[0] }),
         ResponseType::R2 => Response::R2(read_r2(resp)),
         ResponseType::R3 => Response::R3(OcrResponse::from_raw(resp[0])),
         ResponseType::R4 => Response::R4(SdioOcrResponse::from_raw(resp[0])),

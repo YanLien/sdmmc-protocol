@@ -150,18 +150,9 @@ pub fn cmd6(arg: u32) -> Command {
 /// `mode=true` to actually switch; `mode=false` to query support without
 /// changing the configuration.
 pub fn cmd6_high_speed(switch: bool) -> Command {
-    cmd6_sd_access_mode(switch, 1)
-}
-
-/// CMD6 helper: select SD access mode function in group 1.
-///
-/// Function numbers follow the SD Physical Layer access-mode group:
-/// 0 = default/SDR12, 1 = high-speed/SDR25, 2 = SDR50,
-/// 3 = SDR104, 4 = DDR50. Groups 6..2 are set to "no change".
-pub fn cmd6_sd_access_mode(switch: bool, function: u8) -> Command {
     let mode = if switch { 1u32 << 31 } else { 0 };
-    // groups 6..2 are 0xF (no change), group 1 selects access mode.
-    let groups = 0x00FF_FFF0u32 | u32::from(function & 0xF);
+    // groups 6..2 are 0xF (no change), group 1 = 1 (high speed)
+    let groups = 0x00FF_FFF1u32;
     Command::new(6, mode | groups, ResponseType::R1)
 }
 
@@ -265,14 +256,7 @@ pub const CMD38: Command = Command::new(38, 0, ResponseType::R1b);
 
 /// CMD41: SD_SEND_OP_COND — Send operating condition (SD only)
 pub fn cmd41(hcs: bool, voltage_window: u32) -> Command {
-    cmd41_with_s18r(hcs, voltage_window, false)
-}
-
-/// CMD41 variant that can request SD 1.8 V signaling through S18R.
-pub fn cmd41_with_s18r(hcs: bool, voltage_window: u32, s18r: bool) -> Command {
-    let arg = if hcs { 0x4000_0000 } else { 0 }
-        | if s18r { 1 << 24 } else { 0 }
-        | (voltage_window & 0x00FF_F800);
+    let arg = if hcs { 0x4000_0000 } else { 0 } | (voltage_window & 0x00FF_F800);
     Command::new(41, arg, ResponseType::R3)
 }
 
@@ -449,22 +433,6 @@ mod tests {
         assert_eq!(switch.arg, 0x80FF_FFF1);
         let check = cmd6_high_speed(false);
         assert_eq!(check.arg, 0x00FF_FFF1);
-    }
-
-    #[test]
-    fn cmd6_sd_access_mode_arg_selects_group1_function() {
-        let sdr104 = cmd6_sd_access_mode(true, 3);
-        assert_eq!(sdr104.cmd, 6);
-        assert_eq!(sdr104.arg, 0x80FF_FFF3);
-
-        let ddr50 = cmd6_sd_access_mode(false, 4);
-        assert_eq!(ddr50.arg, 0x00FF_FFF4);
-    }
-
-    #[test]
-    fn cmd41_with_s18r_sets_1v8_request_bit() {
-        let cmd = cmd41_with_s18r(true, 0xFF8000, true);
-        assert_eq!(cmd.arg, 0x4100_0000 | 0x00FF_8000);
     }
 
     #[test]

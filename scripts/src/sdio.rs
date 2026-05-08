@@ -151,48 +151,6 @@ pub struct SdioSdmmc<H: SdioHost, D: DelayNs> {
     high_capacity: bool,
     bus_width: BusWidth,
     kind: CardKind,
-    sd_speed_selection_enabled: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SdAccessMode {
-    HighSpeed,
-    Sdr50,
-    Sdr104,
-    Ddr50,
-}
-
-impl SdAccessMode {
-    fn function(self) -> u8 {
-        match self {
-            Self::HighSpeed => 1,
-            Self::Sdr50 => 2,
-            Self::Sdr104 => 3,
-            Self::Ddr50 => 4,
-        }
-    }
-
-    fn clock(self) -> ClockSpeed {
-        match self {
-            Self::HighSpeed => ClockSpeed::HighSpeed,
-            Self::Sdr50 => ClockSpeed::Sdr50,
-            Self::Sdr104 => ClockSpeed::Sdr104,
-            Self::Ddr50 => ClockSpeed::Ddr50,
-        }
-    }
-
-    fn needs_tuning(self) -> bool {
-        matches!(self, Self::Sdr50 | Self::Sdr104)
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::HighSpeed => "HighSpeed",
-            Self::Sdr50 => "SDR50",
-            Self::Sdr104 => "SDR104",
-            Self::Ddr50 => "DDR50",
-        }
-    }
 }
 
 impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
@@ -209,22 +167,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             high_capacity: false,
             bus_width: BusWidth::Bit1,
             kind: CardKind::Sd,
-            sd_speed_selection_enabled: true,
         }
-    }
-
-    /// Returns mutable access to the underlying SDIO host controller.
-    pub fn host_mut(&mut self) -> &mut H {
-        &mut self.host
-    }
-
-    /// Enable or disable optional SD CMD6 speed-mode selection.
-    ///
-    /// When disabled, SD cards still leave identification mode and run at
-    /// default speed, but the driver does not switch the card to HighSpeed or
-    /// UHS-I timing.
-    pub fn set_sd_speed_selection_enabled(&mut self, enabled: bool) {
-        self.sd_speed_selection_enabled = enabled;
     }
 
     /// Which card family the driver detected. Meaningful only after a
@@ -270,7 +213,7 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
 
         // ACMD41 first; if the card never responds at all (typical eMMC),
         // try CMD1 instead.
-        let (kind, ocr) = match self.wait_ready_sd(sd_v2, true) {
+        let (kind, ocr) = match self.wait_ready_sd(sd_v2) {
             Ok(ocr) => (CardKind::Sd, ocr),
             Err(_sd_err) => {
                 info!("sdio: ACMD41 failed ({:?}), trying MMC CMD1", _sd_err);
@@ -330,12 +273,6 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             CardKind::Sd => {
                 info!("sdio: switch SD bus width to 4-bit");
                 self.set_bus_width_sd(BusWidth::Bit4)?;
-                if self.sd_speed_selection_enabled {
-                    self.try_sd_best_speed(ocr);
-                } else {
-                    self.host.set_clock(ClockSpeed::Default)?;
-                    info!("sdio: SD speed selection disabled; staying at default speed");
-                }
             }
             CardKind::Mmc => {
                 info!("sdio: read MMC EXT_CSD");
@@ -419,14 +356,14 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     }
 
     /// Send ACMD41 until card is ready (SD path).
-    fn wait_ready_sd(&mut self, sd_v2: bool, request_1v8: bool) -> Result<OcrResponse, Error> {
+    fn wait_ready_sd(&mut self, sd_v2: bool) -> Result<OcrResponse, Error> {
         let mut elapsed = 0u32;
         loop {
             debug!("sdio: CMD55 before ACMD41 elapsed={}ms", elapsed);
             let cmd55 = crate::cmd::cmd55(0);
             self.host.send_command(&cmd55)?;
 
-            let acmd41 = crate::cmd::cmd41_with_s18r(sd_v2, 0xFF8000, request_1v8);
+            let acmd41 = crate::cmd::cmd41(sd_v2, 0xFF8000);
             match self.host.send_command(&acmd41)? {
                 Response::R3(ocr) => {
                     debug!(
@@ -468,9 +405,6 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
             }
             _ => return Err(Error::BadResponse(ErrorContext::for_cmd(Phase::Init, 1))),
         };
-        if first.card_powered_up() {
-            return Ok(first);
-        }
         let voltage = first.raw & MMC_VOLTAGE_MASK;
         let voltage = if voltage == 0 {
             MMC_VOLTAGE_MASK
@@ -715,82 +649,6 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
         Ok(())
     }
 
-    fn try_sd_best_speed(&mut self, ocr: OcrResponse) {
-        match self.try_sd_best_speed_inner(ocr) {
-            Ok(Some(speed)) => info!("sdio: SD speed selected {:?}", speed),
-            Ok(None) => info!("sdio: SD card stayed at default speed"),
-            Err(e) => warn!("sdio: SD speed selection skipped ({:?})", e),
-        }
-    }
-
-    fn try_sd_best_speed_inner(&mut self, ocr: OcrResponse) -> Result<Option<ClockSpeed>, Error> {
-        let status = self.switch_function(&crate::cmd::cmd6_sd_access_mode(false, 0))?;
-        info!(
-            "sdio: SD access mode support hs={} sdr50={} sdr104={} ddr50={} s18a={}",
-            status.access_mode_supported(SdAccessMode::HighSpeed.function()),
-            status.access_mode_supported(SdAccessMode::Sdr50.function()),
-            status.access_mode_supported(SdAccessMode::Sdr104.function()),
-            status.access_mode_supported(SdAccessMode::Ddr50.function()),
-            ocr.s18a()
-        );
-
-        if ocr.s18a() {
-            for candidate in [
-                SdAccessMode::Sdr104,
-                SdAccessMode::Sdr50,
-                SdAccessMode::Ddr50,
-            ] {
-                if !status.access_mode_supported(candidate.function()) {
-                    continue;
-                }
-                info!("sdio: trying SD {}", candidate.name());
-                match self.try_sd_uhs_mode(candidate) {
-                    Ok(()) => return Ok(Some(candidate.clock())),
-                    Err(e) => warn!("sdio: SD {} failed ({:?})", candidate.name(), e),
-                }
-            }
-        } else {
-            info!("sdio: SD UHS-I skipped because ACMD41 did not report S18A");
-        }
-
-        if status.access_mode_supported(SdAccessMode::HighSpeed.function()) {
-            info!("sdio: trying SD HighSpeed");
-            match self.try_sd_access_mode(SdAccessMode::HighSpeed) {
-                Ok(()) => return Ok(Some(ClockSpeed::HighSpeed)),
-                Err(e) => warn!("sdio: SD HighSpeed failed ({:?})", e),
-            }
-        } else {
-            info!("sdio: SD HighSpeed unsupported by CMD6 status");
-        }
-
-        Ok(None)
-    }
-
-    fn try_sd_uhs_mode(&mut self, mode: SdAccessMode) -> Result<(), Error> {
-        self.host.send_command(&crate::cmd::CMD11)?;
-        self.host.switch_voltage(SignalVoltage::V180)?;
-        self.try_sd_access_mode(mode)?;
-        if mode.needs_tuning() {
-            self.host.execute_tuning(19)?;
-        }
-        Ok(())
-    }
-
-    fn try_sd_access_mode(&mut self, mode: SdAccessMode) -> Result<(), Error> {
-        let status =
-            self.switch_function(&crate::cmd::cmd6_sd_access_mode(true, mode.function()))?;
-        if status.selected_function(1) != mode.function() {
-            return Err(Error::BadResponse(ErrorContext::for_cmd(Phase::Init, 6)));
-        }
-        self.host.set_clock(mode.clock())?;
-        let status = self.status()?;
-        if matches!(status, CardState::Transfer) {
-            Ok(())
-        } else {
-            Err(Error::BadResponse(ErrorContext::for_cmd(Phase::Init, 13)))
-        }
-    }
-
     // ── Data Transfer ───────────────────────────────────────────
 
     /// Read a single 512-byte block
@@ -984,7 +842,6 @@ mod tests {
         commands: Vec<Command>,
         bus_width: Option<BusWidth>,
         next_read_payload: Option<Vec<u8>>,
-        read_payloads: Vec<Vec<u8>>,
         /// When set, `set_bus_width(Bit8)` returns `UnsupportedCommand`
         /// to mimic a host (e.g. the SDHCI MVP backend) that hasn't
         /// wired up 8-bit operation yet.
@@ -1014,7 +871,6 @@ mod tests {
                 commands: Vec::new(),
                 bus_width: None,
                 next_read_payload: None,
-                read_payloads: Vec::new(),
                 reject_bit8: false,
                 last_clock: None,
                 last_voltage: None,
@@ -1032,7 +888,6 @@ mod tests {
                 commands: Vec::new(),
                 bus_width: None,
                 next_read_payload: None,
-                read_payloads: Vec::new(),
                 reject_bit8: false,
                 last_clock: None,
                 last_voltage: None,
@@ -1053,12 +908,7 @@ mod tests {
         }
 
         fn read_data(&mut self, buf: &mut [u8], _block_size: u32) -> Result<(), Error> {
-            let payload = if self.read_payloads.is_empty() {
-                self.next_read_payload.take()
-            } else {
-                Some(self.read_payloads.remove(0))
-            };
-            match payload {
+            match self.next_read_payload.take() {
                 Some(data) if data.len() == buf.len() => {
                     buf.copy_from_slice(&data);
                     Ok(())
@@ -1114,11 +964,6 @@ mod tests {
         Response::R3(OcrResponse::from_raw(0xC0FF_8000))
     }
 
-    fn ocr_ready_sdhc_s18a() -> Response {
-        // bit 31 = power-up done, bit 30 = CCS, bit 24 = S18A
-        Response::R3(OcrResponse::from_raw(0xC1FF_8000))
-    }
-
     fn csd_v2_response() -> Response {
         let mut raw = [0u8; 16];
         raw[0] = 0x40;
@@ -1141,36 +986,21 @@ mod tests {
         Response::R2(raw)
     }
 
-    fn sd_init_replies() -> Vec<Result<Response, Error>> {
-        sd_init_replies_with_ocr(ocr_ready_sdhc())
-    }
-
-    fn sd_init_replies_with_ocr(ocr: Response) -> Vec<Result<Response, Error>> {
-        std::vec![
-            Ok(ok_r1()),                                             // CMD0
-            Ok(Response::R7(IfCondResponse::from_raw(0x0000_01AA))), // CMD8
-            Ok(ok_r1()),                                             // CMD55 (ACMD41 prologue)
-            Ok(ocr),                                                 // ACMD41
-            Ok(cid_response()),                                      // CMD2
-            Ok(rca_response(0x1234)),                                // CMD3
-            Ok(csd_v2_response()),                                   // CMD9
-            Ok(ok_r1()),                                             // CMD7 (select)
-            Ok(ok_r1()),                                             // CMD55 (ACMD6 prologue)
-            Ok(ok_r1()),                                             // ACMD6
-        ]
-    }
-
-    fn switch_status_payload(function: u8, supported: u8) -> Vec<u8> {
-        let mut status = std::vec![0u8; 64];
-        status[13] = supported;
-        status[16] = function & 0x0f;
-        status
-    }
-
     #[test]
     fn init_records_rca_in_driver_state() {
-        let replies = sd_init_replies();
-        let host = MockHost::with_results(replies);
+        let replies = std::vec![
+            ok_r1(),                                             // CMD0
+            Response::R7(IfCondResponse::from_raw(0x0000_01AA)), // CMD8
+            ok_r1(),                                             // CMD55 (ACMD41 prologue)
+            ocr_ready_sdhc(),                                    // ACMD41
+            cid_response(),                                      // CMD2 (CID)
+            rca_response(0x1234),                                // CMD3
+            csd_v2_response(),                                   // CMD9
+            ok_r1(),                                             // CMD7 (select)
+            ok_r1(),                                             // CMD55 (ACMD6 prologue)
+            ok_r1(),                                             // ACMD6
+        ];
+        let host = MockHost::new(replies);
         let mut driver = SdioSdmmc::new(host, NullDelay);
         let info = driver.init().unwrap();
 
@@ -1192,101 +1022,6 @@ mod tests {
             .find(|c| c.cmd == 7)
             .expect("CMD7 issued");
         assert_eq!(cmd7.arg, (0x1234u32) << 16);
-    }
-
-    #[test]
-    fn sd_init_automatically_selects_sdr104_when_card_and_host_agree() {
-        let mut replies = sd_init_replies_with_ocr(ocr_ready_sdhc_s18a());
-        replies.extend([
-            Ok(ok_r1()),         // CMD6 query access modes
-            Ok(ok_r1()),         // CMD11 voltage switch command
-            Ok(ok_r1()),         // CMD6 switch SDR104
-            Ok(r1_tran_ready()), // CMD13 verify
-        ]);
-        let mut host = MockHost::with_results(replies);
-        host.read_payloads = std::vec![
-            switch_status_payload(0, 1 << 3),
-            switch_status_payload(3, 1 << 3),
-        ];
-
-        let mut driver = SdioSdmmc::new(host, NullDelay);
-        driver.init().expect("SD init succeeds with SDR104");
-
-        assert_eq!(driver.host.last_voltage, Some(SignalVoltage::V180));
-        assert_eq!(driver.host.last_clock, Some(ClockSpeed::Sdr104));
-        assert_eq!(driver.host.last_tuning_cmd, Some(19));
-        assert!(
-            driver.host.commands.iter().any(|c| c.cmd == 11),
-            "CMD11 issued before host voltage switch"
-        );
-        assert!(
-            driver
-                .host
-                .commands
-                .iter()
-                .any(|c| c.cmd == 6 && c.arg == 0x80FF_FFF3),
-            "CMD6 switched group 1 to SDR104"
-        );
-    }
-
-    #[test]
-    fn sd_init_falls_back_to_high_speed_when_uhs_voltage_switch_fails() {
-        let mut replies = sd_init_replies_with_ocr(ocr_ready_sdhc_s18a());
-        replies.extend([
-            Ok(ok_r1()),         // CMD6 query access modes
-            Ok(ok_r1()),         // CMD11 voltage switch command
-            Ok(ok_r1()),         // CMD6 switch HighSpeed
-            Ok(r1_tran_ready()), // CMD13 verify
-        ]);
-        let mut host = MockHost::with_results(replies);
-        host.read_payloads = std::vec![
-            switch_status_payload(0, (1 << 3) | (1 << 1)),
-            switch_status_payload(1, 1 << 1),
-        ];
-        host.voltage_switch_result = Some(Error::UnsupportedCommand);
-
-        let mut driver = SdioSdmmc::new(host, NullDelay);
-        driver
-            .init()
-            .expect("SD init falls back when UHS voltage switch fails");
-
-        assert_eq!(driver.host.last_voltage, Some(SignalVoltage::V180));
-        assert_eq!(driver.host.last_clock, Some(ClockSpeed::HighSpeed));
-        assert_eq!(driver.host.last_tuning_cmd, None);
-        assert!(
-            driver
-                .host
-                .commands
-                .iter()
-                .any(|c| c.cmd == 6 && c.arg == 0x80FF_FFF1),
-            "CMD6 switched group 1 to HighSpeed after UHS fallback"
-        );
-    }
-
-    #[test]
-    fn sd_speed_selection_can_be_disabled_for_default_speed_bringup() {
-        let replies = sd_init_replies_with_ocr(ocr_ready_sdhc_s18a());
-        let host = MockHost::with_results(replies);
-        let mut driver = SdioSdmmc::new(host, NullDelay);
-        driver.set_sd_speed_selection_enabled(false);
-
-        driver
-            .init()
-            .expect("SD init succeeds without CMD6 speed switching");
-
-        assert_eq!(driver.host.bus_width, Some(BusWidth::Bit4));
-        assert_eq!(driver.host.last_clock, Some(ClockSpeed::Default));
-        assert!(
-            driver
-                .host
-                .commands
-                .iter()
-                .filter(|c| c.cmd == 6)
-                .all(|c| c.arg == 2),
-            "only ACMD6 bus-width switch is issued; no CMD6 SWITCH_FUNC"
-        );
-        assert_eq!(driver.host.last_voltage, None);
-        assert_eq!(driver.host.last_tuning_cmd, None);
     }
 
     fn ocr_ready_mmc_sector() -> Response {
