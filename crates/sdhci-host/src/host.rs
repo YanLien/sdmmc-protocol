@@ -1,5 +1,8 @@
 //! `Sdhci` core: MMIO accessors, reset, clock and bus-width setup.
 
+use core::ptr::NonNull;
+
+use dma_api::DeviceDma;
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 
 use crate::regs::*;
@@ -25,7 +28,7 @@ pub(crate) struct PendingData {
 /// MMIO base address for an SDHCI v3.x compatible controller. Concurrent
 /// use of the same controller from multiple `Sdhci` instances is undefined.
 pub struct Sdhci {
-    base_addr: usize,
+    base: NonNull<u8>,
     pub(crate) pending_data: Option<PendingData>,
     /// When set, [`issue_command`] programs the controller's transfer mode
     /// register with `DMA_ENABLE`. Set by the ADMA2 wrapper just before it
@@ -40,23 +43,40 @@ pub struct Sdhci {
     /// Command index for the data phase currently being drained by
     /// `read_data` / `write_data`.
     pub(crate) active_data_cmd: u8,
+    pub(crate) dma: Option<DeviceDma>,
 }
 
 impl Sdhci {
-    /// Construct a new Sdhci over the given MMIO base address.
+    /// Construct a new Sdhci over an already-mapped MMIO register file.
     ///
     /// # Safety
     ///
-    /// `base_addr` must point to a memory-mapped SDHCI v3.x register file
+    /// `base` must point to a memory-mapped SDHCI v3.x register file
     /// that the caller has exclusive access to.
-    pub unsafe fn new(base_addr: usize) -> Self {
+    pub unsafe fn new(base: NonNull<u8>) -> Self {
         Self {
-            base_addr,
+            base,
             pending_data: None,
             use_dma: false,
             ext_clock: None,
             active_data_cmd: 0,
+            dma: None,
         }
+    }
+
+    /// Construct a new Sdhci from a raw mapped MMIO address.
+    ///
+    /// Prefer [`Sdhci::new`] when OS glue already tracks the mapping as a
+    /// non-null pointer. This helper keeps legacy bring-up code explicit
+    /// about where the raw address crosses into the portable driver core.
+    ///
+    /// # Safety
+    ///
+    /// `base_addr` must be non-zero and point to a memory-mapped SDHCI v3.x
+    /// register file that the caller has exclusive access to.
+    pub unsafe fn new_from_addr(base_addr: usize) -> Self {
+        let base = NonNull::new(base_addr as *mut u8).expect("MMIO base address must be non-null");
+        unsafe { Self::new(base) }
     }
 
     /// Install a CRU-side clock callback so subsequent `set_clock` calls
@@ -70,6 +90,15 @@ impl Sdhci {
     /// is delegated to the platform.
     pub fn set_external_clock(&mut self, cb: fn(u32) -> Result<(), Error>) {
         self.ext_clock = Some(cb);
+    }
+
+    /// Install a DMA capability used by the high-level data-transfer hooks.
+    ///
+    /// Once installed, `SdioHost::read_data` and `SdioHost::write_data` try
+    /// ADMA2 first for 512-byte block I/O and fall back to the PIO sequence
+    /// if ADMA2 cannot be used.
+    pub fn set_dma(&mut self, dma: DeviceDma) {
+        self.dma = Some(dma);
     }
 
     /// Reset the controller (CMD line + DAT line + state) by writing the
@@ -233,31 +262,58 @@ impl Sdhci {
     }
 
     pub(crate) fn read_u32(&self, off: usize) -> u32 {
-        unsafe { core::ptr::read_volatile((self.base_addr + off) as *const u32) }
+        unsafe { core::ptr::read_volatile(self.reg_ptr::<u32>(off)) }
     }
 
     pub(crate) fn write_u32(&self, off: usize, val: u32) {
-        unsafe { core::ptr::write_volatile((self.base_addr + off) as *mut u32, val) }
+        unsafe { core::ptr::write_volatile(self.reg_ptr::<u32>(off), val) }
     }
 
     pub(crate) fn read_u16(&self, off: usize) -> u16 {
-        unsafe { core::ptr::read_volatile((self.base_addr + off) as *const u16) }
+        unsafe { core::ptr::read_volatile(self.reg_ptr::<u16>(off)) }
     }
 
     pub(crate) fn write_u16(&self, off: usize, val: u16) {
-        unsafe { core::ptr::write_volatile((self.base_addr + off) as *mut u16, val) }
+        unsafe { core::ptr::write_volatile(self.reg_ptr::<u16>(off), val) }
     }
 
     pub(crate) fn read_u8(&self, off: usize) -> u8 {
-        unsafe { core::ptr::read_volatile((self.base_addr + off) as *const u8) }
+        unsafe { core::ptr::read_volatile(self.reg_ptr::<u8>(off)) }
     }
 
     pub(crate) fn write_u8(&self, off: usize, val: u8) {
-        unsafe { core::ptr::write_volatile((self.base_addr + off) as *mut u8, val) }
+        unsafe { core::ptr::write_volatile(self.reg_ptr::<u8>(off), val) }
+    }
+
+    #[inline]
+    fn reg_ptr<T>(&self, off: usize) -> *mut T {
+        unsafe { self.base.as_ptr().add(off).cast::<T>() }
     }
 }
 
 #[inline]
 fn spin_loop() {
     core::hint::spin_loop();
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+
+    use super::*;
+
+    #[test]
+    fn constructs_from_mapped_mmio_pointer() {
+        let base = NonNull::new(0x1000_0000 as *mut u8).unwrap();
+        let host = unsafe { Sdhci::new(base) };
+
+        assert_eq!(host.base.as_ptr() as usize, 0x1000_0000);
+    }
+
+    #[test]
+    fn legacy_addr_constructor_keeps_raw_mmio_boundary_explicit() {
+        let host = unsafe { Sdhci::new_from_addr(0x1000_0000) };
+
+        assert_eq!(host.base.as_ptr() as usize, 0x1000_0000);
+    }
 }

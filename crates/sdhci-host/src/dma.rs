@@ -2,88 +2,33 @@
 //!
 //! The crate is `no_std` and refuses to assume an allocator, an MMU layout,
 //! or a particular cache architecture. Callers wire those concerns up via
-//! the [`Dma`] trait and a caller-owned [`Adma2Buffer`] descriptor scratch
-//! region.
+//! `dma-api`'s [`DeviceDma`].
 //!
 //! ## Responsibilities split
 //!
 //! - **The host driver** builds the ADMA2 descriptor table inside the
-//!   buffer the caller hands it, programs the controller, and waits on the
+//!   DMA descriptor buffer, programs the controller, and waits on the
 //!   transfer-complete IRQ.
-//! - **The [`Dma`] impl** translates kernel/CPU pointers to the bus
+//! - **The [`DeviceDma`] impl** translates kernel/CPU pointers to the bus
 //!   addresses the SDHCI sees, and performs whatever cache maintenance is
 //!   needed before the device reads CPU-written memory and after the
 //!   device writes CPU-read memory.
 //!
 //! That split keeps the SDHCI logic portable across hosted Linux (where
-//! `Dma::map_*` typically calls `dma_map_single`), bare-metal coherent
+//! `DeviceDma` typically calls `dma_map_single`), bare-metal coherent
 //! systems (identity mapping, no cache ops), and bare-metal incoherent
 //! systems (identity mapping + dcache flush/invalidate).
 
-use core::cell::RefCell;
+use core::{num::NonZeroUsize, ptr::NonNull};
 
+use dma_api::{DeviceDma, DmaDirection};
 use sdmmc_protocol::{
-    cmd::{Command, DataDirection},
+    cmd::{Command, DataDirection, cmd17, cmd18, cmd24, cmd25},
     error::{Error, ErrorContext, Phase},
     response::Response,
-    sdio::{BusWidth, ClockSpeed, SdioHost},
 };
 
 use crate::host::{PendingData, Sdhci};
-
-/// Direction of an outstanding DMA mapping. Mirrors `DataDirection` so the
-/// host can hand it through to the [`Dma`] implementation without dragging
-/// the protocol enum into platform code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DmaDir {
-    /// Memory will be filled by the device (card → host).
-    FromDevice,
-    /// Memory will be read by the device (host → card).
-    ToDevice,
-}
-
-impl From<DataDirection> for DmaDir {
-    fn from(d: DataDirection) -> Self {
-        match d {
-            DataDirection::Read => DmaDir::FromDevice,
-            // `None` cannot reach the DMA path — `prepare_data_transfer`
-            // gates that. Conservative default keeps the conversion total.
-            DataDirection::Write | DataDirection::None => DmaDir::ToDevice,
-        }
-    }
-}
-
-/// Platform-supplied DMA mapping interface.
-///
-/// Implementations are expected to be cheap and side-effect-free except for
-/// the cache maintenance noted on each method.
-pub trait Dma {
-    /// Translate a CPU virtual address inside `buf` to the bus address the
-    /// SDHCI controller will see. On systems with an identity DMA mapping
-    /// this is just `buf.as_ptr() as u64`; on systems with an IOMMU or a
-    /// DMA offset it is whatever the platform's mapping layer returns.
-    ///
-    /// `dir` is provided so that platforms backed by `dma_map_single`-style
-    /// APIs can call the right map flavour. Implementations that do not
-    /// pin the mapping per-call should ignore it.
-    fn map(&self, buf: *const u8, len: usize, dir: DmaDir) -> u64;
-
-    /// Cache-maintenance hook called *before* the device reads
-    /// host-written memory (writes) or *before* the device fills
-    /// host-readable memory (reads).
-    ///
-    /// On coherent systems this is a no-op. On incoherent ARM/AArch64 this
-    /// is typically `dcache clean` for `ToDevice` and `dcache invalidate`
-    /// for `FromDevice`.
-    fn before_dma(&self, buf: *const u8, len: usize, dir: DmaDir);
-
-    /// Cache-maintenance hook called *after* the transfer completes.
-    ///
-    /// On coherent systems this is a no-op. On incoherent systems this is
-    /// typically `dcache invalidate` after a `FromDevice` transfer so the
-    /// CPU sees the device's writes.
-    fn after_dma(&self, buf: *const u8, len: usize, dir: DmaDir);
-}
 
 /// 32-bit ADMA2 descriptor.
 ///
@@ -121,40 +66,13 @@ const ADMA2_MAX_PER_DESC: usize = 65_528; // 64 KiB - 8B, multiple of 8
 /// on page boundary crossings. Bumping this constant is the only thing
 /// needed to support larger contiguous transfers.
 pub const ADMA2_DESC_COUNT: usize = 16;
-
-/// Storage for the ADMA2 descriptor table. Allocate one of these once per
-/// host instance and hand it to [`SdhciAdma2::new`]. The buffer itself is
-/// what the controller DMA-reads, so it must live in DMA-capable memory
-/// and the [`Dma`] impl must produce a sensible bus address for it.
-#[repr(C, align(64))]
-pub struct Adma2Buffer {
-    pub(crate) descs: RefCell<[Adma2Desc32; ADMA2_DESC_COUNT]>,
-}
-
-impl Adma2Buffer {
-    pub const fn new() -> Self {
-        Self {
-            descs: RefCell::new(
-                [Adma2Desc32 {
-                    attr: 0,
-                    length: 0,
-                    address: 0,
-                }; ADMA2_DESC_COUNT],
-            ),
-        }
-    }
-}
-
-impl Default for Adma2Buffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub const ADMA2_DESC_ALIGN: usize = 64;
+const BLOCK_SIZE: usize = 512;
 
 /// Build the ADMA2 descriptor table covering `[base, base+total_len)`.
 ///
 /// `base` is the *bus* address the controller will use, already translated
-/// by [`Dma::map`]. Returns the number of descriptors written or
+/// by [`DeviceDma`]. Returns the number of descriptors written or
 /// [`Error::Misaligned`] if the buffer would not fit in
 /// [`ADMA2_DESC_COUNT`] entries.
 pub(crate) fn build_descriptors(
@@ -200,176 +118,319 @@ pub(crate) fn build_descriptors(
     Ok(written)
 }
 
-/// SDHCI host backend that funnels data through ADMA2 instead of PIO.
-///
-/// `SdhciAdma2` borrows the underlying [`Sdhci`] for command issue, reset,
-/// and clocking, but overrides the data-phase methods to program the
-/// ADMA descriptor pointer and let the controller's DMA engine move the
-/// payload. Callers supply a [`Dma`] implementation that translates CPU
-/// pointers to bus addresses and performs the platform-specific cache
-/// maintenance.
-///
-/// # Lifetime
-///
-/// The descriptor scratch lives in [`Adma2Buffer`] and is borrowed for the
-/// life of the wrapper. Allocate one per controller alongside the
-/// `Sdhci` itself; do not share it between controllers.
-///
-/// # Constraints
-///
-/// - 32-bit ADMA2 only. Bus addresses must fit in 32 bits.
-/// - Buffers handed to [`SdioHost::read_data`] / [`SdioHost::write_data`]
-///   must be naturally aligned to at least 4 bytes (the ADMA2 spec
-///   requires the source/destination to be 32-bit aligned). Misaligned
-///   buffers return [`Error::Misaligned`] without touching the hardware.
-/// - The data length must equal `block_size * block_count`, which the
-///   protocol layer already guarantees.
-pub struct SdhciAdma2<'buf, D: Dma> {
-    inner: Sdhci,
-    dma: D,
-    table: &'buf Adma2Buffer,
-}
+impl Sdhci {
+    pub(crate) fn try_adma2_read_transfer(
+        &mut self,
+        cmd: &Command,
+        buf: &mut [u8],
+        block_size: u32,
+        expected_block_count: u32,
+    ) -> Result<Response, Error> {
+        if !self.supports_adma2() || block_size as usize != BLOCK_SIZE || buf.is_empty() {
+            return Err(Error::UnsupportedCommand);
+        }
+        let dma = self.dma.clone().ok_or(Error::UnsupportedCommand)?;
+        let size = NonZeroUsize::new(buf.len()).ok_or(Error::InvalidArgument)?;
+        let block_count = dma_read_block_count(size)?;
+        if block_count != expected_block_count {
+            return Err(Error::InvalidArgument);
+        }
+        let map = dma
+            .map_single_array(buf, BLOCK_SIZE, DmaDirection::FromDevice)
+            .map_err(map_dma_error)?;
+        let mut desc = dma
+            .array_zero_with_align::<Adma2Desc32>(
+                ADMA2_DESC_COUNT,
+                ADMA2_DESC_ALIGN,
+                DmaDirection::ToDevice,
+            )
+            .map_err(map_dma_error)?;
 
-impl<'buf, D: Dma> SdhciAdma2<'buf, D> {
-    /// Wrap an existing [`Sdhci`] in an ADMA2 data path.
+        let response = self.dma_data_transfer_mapped(
+            cmd,
+            block_count,
+            map.dma_addr().as_u64(),
+            &mut desc,
+            DataDirection::Read,
+            Phase::DataRead,
+        )?;
+        map.prepare_read_all();
+        Ok(response)
+    }
+
+    pub(crate) fn try_adma2_write_transfer(
+        &mut self,
+        cmd: &Command,
+        buf: &[u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error> {
+        if !self.supports_adma2() || block_size as usize != BLOCK_SIZE || buf.is_empty() {
+            return Err(Error::UnsupportedCommand);
+        }
+        let dma = self.dma.clone().ok_or(Error::UnsupportedCommand)?;
+        let size = NonZeroUsize::new(buf.len()).ok_or(Error::InvalidArgument)?;
+        let computed_block_count = dma_write_block_count(size)?;
+        if computed_block_count != block_count {
+            return Err(Error::InvalidArgument);
+        }
+        let map = dma
+            .map_single_array(buf, BLOCK_SIZE, DmaDirection::ToDevice)
+            .map_err(map_dma_error)?;
+        map.confirm_write_all();
+
+        let mut desc = dma
+            .array_zero_with_align::<Adma2Desc32>(
+                ADMA2_DESC_COUNT,
+                ADMA2_DESC_ALIGN,
+                DmaDirection::ToDevice,
+            )
+            .map_err(map_dma_error)?;
+
+        self.dma_data_transfer_mapped(
+            cmd,
+            block_count,
+            map.dma_addr().as_u64(),
+            &mut desc,
+            DataDirection::Write,
+            Phase::DataWrite,
+        )
+    }
+
+    /// Read whole 512-byte blocks using the controller's 32-bit ADMA2 engine.
     ///
-    /// The caller is responsible for having reset and clocked the
-    /// controller before any commands flow; reusing the [`Sdhci`] API for
-    /// that is fine.
-    pub fn new(inner: Sdhci, dma: D, table: &'buf Adma2Buffer) -> Self {
-        Self { inner, dma, table }
+    /// `start_block` is the card address to place in CMD17/CMD18. Callers
+    /// that know whether the card uses byte or sector addressing must apply
+    /// that translation before calling this method.
+    pub fn dma_read_blocks_into(
+        &mut self,
+        start_block: u32,
+        buffer: NonNull<u8>,
+        size: NonZeroUsize,
+        dma: &DeviceDma,
+    ) -> Result<(), Error> {
+        let block_count = dma_read_block_count(size)?;
+        let map = dma
+            .map_single_array(
+                unsafe { core::slice::from_raw_parts(buffer.as_ptr(), size.get()) },
+                BLOCK_SIZE,
+                DmaDirection::FromDevice,
+            )
+            .map_err(map_dma_error)?;
+        let mut desc = dma
+            .array_zero_with_align::<Adma2Desc32>(
+                ADMA2_DESC_COUNT,
+                ADMA2_DESC_ALIGN,
+                DmaDirection::ToDevice,
+            )
+            .map_err(map_dma_error)?;
+
+        self.dma_read_blocks_mapped(start_block, block_count, map.dma_addr().as_u64(), &mut desc)?;
+        map.prepare_read_all();
+        Ok(())
     }
 
-    /// Borrow the underlying PIO controller. Useful for one-off setup
-    /// (e.g. `enable_clock`, `set_power`) where the DMA layer is
-    /// irrelevant.
-    pub fn raw(&mut self) -> &mut Sdhci {
-        &mut self.inner
+    /// Write whole 512-byte blocks using the controller's 32-bit ADMA2 engine.
+    ///
+    /// `start_block` is the card address to place in CMD24/CMD25. Callers
+    /// that know whether the card uses byte or sector addressing must apply
+    /// that translation before calling this method.
+    pub fn dma_write_blocks_from(
+        &mut self,
+        start_block: u32,
+        buffer: NonNull<u8>,
+        size: NonZeroUsize,
+        dma: &DeviceDma,
+    ) -> Result<(), Error> {
+        let block_count = dma_write_block_count(size)?;
+        let map = dma
+            .map_single_array(
+                unsafe { core::slice::from_raw_parts(buffer.as_ptr(), size.get()) },
+                BLOCK_SIZE,
+                DmaDirection::ToDevice,
+            )
+            .map_err(map_dma_error)?;
+        map.confirm_write_all();
+
+        let mut desc = dma
+            .array_zero_with_align::<Adma2Desc32>(
+                ADMA2_DESC_COUNT,
+                ADMA2_DESC_ALIGN,
+                DmaDirection::ToDevice,
+            )
+            .map_err(map_dma_error)?;
+
+        self.dma_write_blocks_mapped(start_block, block_count, map.dma_addr().as_u64(), &mut desc)
     }
 
-    fn run_dma(&mut self, ptr: *const u8, len: usize, dir: DmaDir) -> Result<(), Error> {
-        // 1. Translate + cache-maintain the payload buffer.
-        let bus_addr = self.dma.map(ptr, len, dir);
-        self.dma.before_dma(ptr, len, dir);
+    fn dma_read_blocks_mapped(
+        &mut self,
+        start_block: u32,
+        block_count: u32,
+        buffer_dma: u64,
+        desc: &mut dma_api::DArray<Adma2Desc32>,
+    ) -> Result<(), Error> {
+        if block_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let byte_count = block_count
+            .checked_mul(BLOCK_SIZE as u32)
+            .ok_or(Error::InvalidArgument)? as usize;
+        build_descriptors_into_dma(desc, buffer_dma, byte_count, Phase::DataRead)?;
 
-        // 2. Build the descriptor table and translate its address too.
-        let descs_ptr = {
-            let mut descs = self.table.descs.borrow_mut();
-            let _written = build_descriptors(
-                &mut descs,
-                bus_addr,
-                len,
-                match dir {
-                    DmaDir::FromDevice => Phase::DataRead,
-                    DmaDir::ToDevice => Phase::DataWrite,
-                },
-            )?;
-            descs.as_ptr() as *const u8
-        };
-        // Descriptor table itself is host-written, device-read.
-        let desc_len = core::mem::size_of::<Adma2Desc32>() * ADMA2_DESC_COUNT;
-        let desc_bus = self.dma.map(descs_ptr, desc_len, DmaDir::ToDevice);
-        self.dma.before_dma(descs_ptr, desc_len, DmaDir::ToDevice);
-
-        if desc_bus >> 32 != 0 {
+        let desc_bus = desc.dma_addr().as_u64();
+        let desc_end = desc_bus
+            .checked_add(desc.bytes_len() as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if desc_end > u32::MAX as u64 + 1 {
             return Err(Error::BadResponse(ErrorContext::new(Phase::DataRead)));
         }
 
-        // 3. Program the controller. `use_dma` was already set on the
-        //    inner Sdhci by `prepare_data_transfer`, so the upcoming
-        //    `issue_command` call will set TRANSFER_MODE.DMA_ENABLE.
-        self.inner.select_adma2_32();
-        self.inner.write_adma_addr(desc_bus as u32);
+        let cmd = if block_count == 1 {
+            cmd17(start_block)
+        } else {
+            cmd18(start_block)
+        };
+        self.dma_data_transfer_prepared(
+            &cmd,
+            block_count,
+            desc_bus as u32,
+            DataDirection::Read,
+            Phase::DataRead,
+        )?;
         Ok(())
+    }
+
+    fn dma_write_blocks_mapped(
+        &mut self,
+        start_block: u32,
+        block_count: u32,
+        buffer_dma: u64,
+        desc: &mut dma_api::DArray<Adma2Desc32>,
+    ) -> Result<(), Error> {
+        if block_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let byte_count = block_count
+            .checked_mul(BLOCK_SIZE as u32)
+            .ok_or(Error::InvalidArgument)? as usize;
+        build_descriptors_into_dma(desc, buffer_dma, byte_count, Phase::DataWrite)?;
+
+        let desc_bus = desc.dma_addr().as_u64();
+        let desc_end = desc_bus
+            .checked_add(desc.bytes_len() as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if desc_end > u32::MAX as u64 + 1 {
+            return Err(Error::BadResponse(ErrorContext::new(Phase::DataWrite)));
+        }
+
+        let cmd = if block_count == 1 {
+            cmd24(start_block)
+        } else {
+            cmd25(start_block)
+        };
+        self.dma_data_transfer_prepared(
+            &cmd,
+            block_count,
+            desc_bus as u32,
+            DataDirection::Write,
+            Phase::DataWrite,
+        )?;
+        Ok(())
+    }
+
+    fn dma_data_transfer_mapped(
+        &mut self,
+        cmd: &Command,
+        block_count: u32,
+        buffer_dma: u64,
+        desc: &mut dma_api::DArray<Adma2Desc32>,
+        direction: DataDirection,
+        phase: Phase,
+    ) -> Result<Response, Error> {
+        if block_count == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let byte_count = block_count
+            .checked_mul(BLOCK_SIZE as u32)
+            .ok_or(Error::InvalidArgument)? as usize;
+        build_descriptors_into_dma(desc, buffer_dma, byte_count, phase)?;
+
+        let desc_bus = desc.dma_addr().as_u64();
+        let desc_end = desc_bus
+            .checked_add(desc.bytes_len() as u64)
+            .ok_or(Error::InvalidArgument)?;
+        if desc_end > u32::MAX as u64 + 1 {
+            return Err(Error::BadResponse(ErrorContext::new(phase)));
+        }
+
+        self.dma_data_transfer_prepared(cmd, block_count, desc_bus as u32, direction, phase)
+    }
+
+    fn dma_data_transfer_prepared(
+        &mut self,
+        cmd: &Command,
+        block_count: u32,
+        desc_bus: u32,
+        direction: DataDirection,
+        phase: Phase,
+    ) -> Result<Response, Error> {
+        self.pending_data = Some(PendingData {
+            direction,
+            block_size: BLOCK_SIZE as u32,
+            block_count,
+        });
+        self.use_dma = true;
+        self.select_adma2_32();
+        self.write_adma_addr(desc_bus);
+
+        let result = self.issue_command(cmd).and_then(|response| {
+            self.wait_data_complete_with_adma(self.active_data_cmd, phase)?;
+            Ok(response)
+        });
+        self.use_dma = false;
+        result
     }
 }
 
-impl<'buf, D: Dma> SdioHost for SdhciAdma2<'buf, D> {
-    fn send_command(&mut self, cmd: &Command) -> Result<Response, Error> {
-        self.inner.issue_command(cmd)
+fn build_descriptors_into_dma(
+    desc: &mut dma_api::DArray<Adma2Desc32>,
+    base: u64,
+    total_len: usize,
+    phase: Phase,
+) -> Result<usize, Error> {
+    if desc.len() < ADMA2_DESC_COUNT {
+        return Err(Error::InvalidArgument);
     }
+    let mut table = [Adma2Desc32::default(); ADMA2_DESC_COUNT];
+    let written = build_descriptors(&mut table, base, total_len, phase)?;
+    desc.write_with(ADMA2_DESC_COUNT, |descs| {
+        descs.copy_from_slice(&table);
+    });
+    Ok(written)
+}
 
-    fn read_data(&mut self, buf: &mut [u8], block_size: u32) -> Result<(), Error> {
-        if block_size == 0 || !(buf.len() as u32).is_multiple_of(block_size) {
-            return Err(Error::Misaligned);
-        }
-        if buf.as_ptr() as usize & 0x3 != 0 {
-            return Err(Error::Misaligned);
-        }
-        let len = buf.len();
-        let ptr = buf.as_mut_ptr();
-        self.run_dma(ptr, len, DmaDir::FromDevice)?;
-
-        // The command was already issued and DMA started. Wait on the
-        // controller's transfer-complete IRQ status flag (or an ADMA
-        // error).
-        self.inner
-            .wait_data_complete_with_adma(self.inner.active_data_cmd, Phase::DataRead)?;
-
-        // Flush/invalidate cache so the CPU sees what the device wrote.
-        self.dma.after_dma(ptr, len, DmaDir::FromDevice);
-        Ok(())
+fn dma_read_block_count(size: NonZeroUsize) -> Result<u32, Error> {
+    let len = size.get();
+    if !len.is_multiple_of(BLOCK_SIZE) {
+        return Err(Error::Misaligned);
     }
+    let blocks = len / BLOCK_SIZE;
+    u32::try_from(blocks).map_err(|_| Error::InvalidArgument)
+}
 
-    fn write_data(&mut self, buf: &[u8], block_size: u32) -> Result<(), Error> {
-        if block_size == 0 || !(buf.len() as u32).is_multiple_of(block_size) {
-            return Err(Error::Misaligned);
-        }
-        if buf.as_ptr() as usize & 0x3 != 0 {
-            return Err(Error::Misaligned);
-        }
-        let len = buf.len();
-        let ptr = buf.as_ptr();
-        self.run_dma(ptr, len, DmaDir::ToDevice)?;
-        self.inner
-            .wait_data_complete_with_adma(self.inner.active_data_cmd, Phase::DataWrite)?;
-        self.dma.after_dma(ptr, len, DmaDir::ToDevice);
-        Ok(())
-    }
+fn dma_write_block_count(size: NonZeroUsize) -> Result<u32, Error> {
+    dma_read_block_count(size)
+}
 
-    fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error> {
-        self.inner.set_bus_width(width)
-    }
-
-    fn set_clock(&mut self, speed: ClockSpeed) -> Result<(), Error> {
-        self.inner.set_clock(speed)
-    }
-
-    fn set_block_count(&mut self, count: u32) -> Result<(), Error> {
-        self.inner.set_block_count(count)
-    }
-
-    fn prepare_data_transfer(
-        &mut self,
-        direction: DataDirection,
-        block_size: u32,
-        block_count: u32,
-    ) -> Result<(), Error> {
-        // Same bookkeeping as the PIO impl, plus the DMA-mode flag so the
-        // next issue_command flips TRANSFER_MODE.DMA_ENABLE.
-        if direction.is_none() {
-            self.inner.pending_data = None;
-            self.inner.use_dma = false;
-        } else {
-            self.inner.pending_data = Some(PendingData {
-                direction,
-                block_size,
-                block_count,
-            });
-            self.inner.use_dma = true;
-        }
-        Ok(())
-    }
-
-    fn switch_voltage(
-        &mut self,
-        voltage: sdmmc_protocol::sdio::SignalVoltage,
-    ) -> Result<(), Error> {
-        self.inner.switch_voltage(voltage)
-    }
-
-    fn execute_tuning(&mut self, cmd_index: u8) -> Result<(), Error> {
-        self.inner.execute_tuning(cmd_index)
+fn map_dma_error(err: dma_api::DmaError) -> Error {
+    match err {
+        dma_api::DmaError::NoMemory => Error::BusError(ErrorContext::new(Phase::DataRead)),
+        dma_api::DmaError::LayoutError(_)
+        | dma_api::DmaError::DmaMaskNotMatch { .. }
+        | dma_api::DmaError::AlignMismatch { .. }
+        | dma_api::DmaError::NullPointer
+        | dma_api::DmaError::ZeroSizedBuffer => Error::InvalidArgument,
     }
 }
 
@@ -426,5 +487,23 @@ mod tests {
         let mut table = empty_table();
         let err = build_descriptors(&mut table, 0, 0, Phase::DataRead).unwrap_err();
         assert!(matches!(err, Error::Misaligned));
+    }
+
+    #[test]
+    fn sdhci_dma_read_plan_rejects_non_block_sized_buffers() {
+        let size = core::num::NonZeroUsize::new(513).unwrap();
+        assert_eq!(dma_read_block_count(size), Err(Error::Misaligned));
+    }
+
+    #[test]
+    fn sdhci_dma_read_plan_reports_block_count() {
+        let size = core::num::NonZeroUsize::new(1024).unwrap();
+        assert_eq!(dma_read_block_count(size), Ok(2));
+    }
+
+    #[test]
+    fn sdhci_dma_write_plan_rejects_non_block_sized_buffers() {
+        let size = core::num::NonZeroUsize::new(513).unwrap();
+        assert_eq!(dma_write_block_count(size), Err(Error::Misaligned));
     }
 }

@@ -21,14 +21,15 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use embedded_hal::delay::DelayNs;
-//! use sdmmc_protocol::sdio::SdioSdmmc;
+//! use core::ptr::NonNull;
+//! use sdmmc_protocol::sdio::{DelayNs, SdioSdmmc};
 //! use dwmmc_host::DwMmc;
 //!
 //! # fn make_delay() -> impl DelayNs { struct N; impl DelayNs for N { fn delay_ns(&mut self, _: u32) {} } N }
 //! // SAFETY: 0xFE2B_0000 must point at a valid DW_mshc register file
 //! // the caller has exclusive access to.
-//! let mut host = unsafe { DwMmc::new(0xFE2B_0000) };
+//! let mmio = NonNull::new(0xFE2B_0000 as *mut u8).unwrap();
+//! let mut host = unsafe { DwMmc::new(mmio) };
 //! host.set_reference_clock(50_000_000);
 //! host.reset_and_init().expect("controller reset");
 //!
@@ -56,30 +57,86 @@ use sdmmc_protocol::{
     sdio::{BusWidth, ClockSpeed, SdioHost, SignalVoltage},
 };
 
-use crate::host::PendingData;
 pub use crate::{
-    dma::{IDMAC_DESC_ALIGN, IDMAC_DESC_SIZE, IdmacRead},
+    dma::{IDMAC_DESC_ALIGN, IDMAC_DESC_SIZE},
     host::{DEFAULT_FIFO_OFFSET, DwMmc},
 };
+use crate::{host::PendingData, regs::RegisterBlockVolatileFieldAccess};
+
+/// Stable controller event extracted from DW_mshc raw interrupt status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// No status bit requiring runtime action is currently pending.
+    None,
+    /// A command response has completed.
+    CommandComplete,
+    /// A data transfer has completed.
+    TransferComplete,
+    /// Receive FIFO can be drained.
+    ReceiveReady,
+    /// Transmit FIFO can accept more data.
+    TransmitReady,
+    /// One or more controller error bits are pending.
+    Error { raw_status: u32 },
+    /// Status bits are pending but do not map to a high-level event yet.
+    Other { raw_status: u32 },
+}
 
 impl SdioHost for DwMmc {
     fn send_command(&mut self, cmd: &Command) -> Result<Response, Error> {
         self.issue_command(cmd)
     }
 
-    fn read_data(&mut self, buf: &mut [u8], _block_size: u32) -> Result<(), Error> {
-        // Block size was already programmed via `prepare_data_transfer`
-        // → `program_data_phase`. We just drain `buf.len()` bytes.
-        let is_last_block = self.data_blocks_remaining <= 1;
-        let result = self.pio_read(buf, self.data_cmd_index, is_last_block);
-        if result.is_ok() && self.data_blocks_remaining > 0 {
-            self.data_blocks_remaining -= 1;
+    fn read_data(
+        &mut self,
+        cmd: &Command,
+        buf: &mut [u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error> {
+        match self.try_idmac_read_transfer(cmd, buf, block_size, block_count) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                log::debug!("dwmmc: IDMAC read transfer unavailable/failed: {:?}", err);
+                <Self as SdioHost>::prepare_data_transfer(
+                    self,
+                    DataDirection::Read,
+                    block_size,
+                    block_count,
+                )?;
+                <Self as SdioHost>::set_block_count(self, block_count)?;
+                let response = self.send_command(cmd)?;
+                self.pio_read(buf, self.data_cmd_index, true)?;
+                self.data_blocks_remaining = 0;
+                Ok(response)
+            }
         }
-        result
     }
 
-    fn write_data(&mut self, buf: &[u8], _block_size: u32) -> Result<(), Error> {
-        self.pio_write(buf, self.data_cmd_index)
+    fn write_data(
+        &mut self,
+        cmd: &Command,
+        buf: &[u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error> {
+        match self.try_idmac_write_transfer(cmd, buf, block_size, block_count) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                log::debug!("dwmmc: IDMAC write transfer unavailable/failed: {:?}", err);
+                <Self as SdioHost>::prepare_data_transfer(
+                    self,
+                    DataDirection::Write,
+                    block_size,
+                    block_count,
+                )?;
+                <Self as SdioHost>::set_block_count(self, block_count)?;
+                let response = self.send_command(cmd)?;
+                self.pio_write(buf, self.data_cmd_index)?;
+                self.data_blocks_remaining = 0;
+                Ok(response)
+            }
+        }
     }
 
     fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error> {
@@ -123,6 +180,39 @@ impl SdioHost for DwMmc {
 
     fn switch_voltage(&mut self, voltage: SignalVoltage) -> Result<(), Error> {
         self.set_signal_voltage(voltage)
+    }
+}
+
+pub(crate) fn event_from_raw_status(raw_status: u32) -> Event {
+    let status = crate::regs::RIntSts::from_bits(raw_status);
+    if raw_status == 0 {
+        Event::None
+    } else if status.error() {
+        Event::Error { raw_status }
+    } else if status.command_done() {
+        Event::CommandComplete
+    } else if status.data_transfer_over() {
+        Event::TransferComplete
+    } else if status.receive_fifo_data_request() {
+        Event::ReceiveReady
+    } else if status.transmit_fifo_data_request() {
+        Event::TransmitReady
+    } else {
+        Event::Other { raw_status }
+    }
+}
+
+impl DwMmc {
+    /// Read and acknowledge pending controller status, returning a stable
+    /// event for OS glue to translate into wakeups or worker scheduling.
+    pub fn handle_irq(&mut self) -> Event {
+        let raw_status = self.regs.rintsts().read().into_bits();
+        if raw_status != 0 {
+            self.regs
+                .rintsts()
+                .write(crate::regs::RIntSts::from_bits(raw_status));
+        }
+        event_from_raw_status(raw_status)
     }
 }
 
@@ -180,6 +270,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_reports_command_completion_without_os_wakeup_policy() {
+        let raw = crate::regs::RIntSts::new()
+            .with_command_done(true)
+            .into_bits();
+
+        assert_eq!(event_from_raw_status(raw), Event::CommandComplete);
+    }
+
+    #[test]
+    fn event_reports_transfer_completion_without_os_wakeup_policy() {
+        let raw = crate::regs::RIntSts::new()
+            .with_data_transfer_over(true)
+            .into_bits();
+
+        assert_eq!(event_from_raw_status(raw), Event::TransferComplete);
+    }
+
+    #[test]
+    fn event_reports_error_status_without_translating_to_os_action() {
+        let raw = crate::regs::RIntSts::new()
+            .with_response_timeout(true)
+            .into_bits();
+
+        assert_eq!(event_from_raw_status(raw), Event::Error { raw_status: raw });
+    }
+
+    #[test]
     fn uhs_i_sdr_modes_keep_ddr_disabled() {
         let cur = UhsBits { ddr: 1, volt: 1 };
 
@@ -222,7 +339,7 @@ mod tests {
 
     #[test]
     fn data_command_index_is_recorded_for_diagnostics() {
-        let mut host = unsafe { DwMmc::new(0x1000_0000) };
+        let mut host = unsafe { DwMmc::new_from_addr(0x1000_0000) };
         host.data_cmd_index = 6;
 
         assert_eq!(host.data_cmd_index, 6);

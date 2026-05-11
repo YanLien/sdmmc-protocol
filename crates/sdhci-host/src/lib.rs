@@ -16,38 +16,34 @@
 //! # Usage
 //!
 //! ```no_run
-//! use embedded_hal::delay::DelayNs;
-//! use sdmmc_protocol::sdio::SdioSdmmc;
+//! use core::ptr::NonNull;
+//! use sdmmc_protocol::sdio::{DelayNs, SdioSdmmc};
 //! use sdhci_host::Sdhci;
 //!
 //! # fn make_delay() -> impl DelayNs { struct N; impl DelayNs for N { fn delay_ns(&mut self, _: u32) {} } N }
-//! let host = unsafe { Sdhci::new(0xFE31_0000) };
+//! let mmio = NonNull::new(0xFE31_0000 as *mut u8).unwrap();
+//! let host = unsafe { Sdhci::new(mmio) };
 //! let delay = make_delay();
 //! let mut card = SdioSdmmc::new(host, delay);
 //! // card.init()?;
 //! ```
 //!
-//! For ADMA2, wrap the controller in [`SdhciAdma2`] and supply a [`Dma`]
-//! implementation plus a caller-owned [`Adma2Buffer`]:
+//! For ADMA2 request I/O, pass a `dma_api::DeviceDma` capability into
+//! [`Sdhci::dma_read_blocks_into`]. The driver core maps the request
+//! buffer, allocates the ADMA2 descriptor table, and performs cache sync:
 //!
-//! ```no_run
-//! use embedded_hal::delay::DelayNs;
-//! use sdhci_host::{Adma2Buffer, Dma, DmaDir, Sdhci, SdhciAdma2};
-//! use sdmmc_protocol::sdio::SdioSdmmc;
+//! ```ignore
+//! use core::{num::NonZeroUsize, ptr::NonNull};
+//! use dma_api::DeviceDma;
+//! use sdhci_host::Sdhci;
 //!
-//! struct IdentityDma;
-//! impl Dma for IdentityDma {
-//!     fn map(&self, p: *const u8, _len: usize, _dir: DmaDir) -> u64 { p as u64 }
-//!     fn before_dma(&self, _: *const u8, _: usize, _: DmaDir) {}
-//!     fn after_dma(&self, _: *const u8, _: usize, _: DmaDir) {}
-//! }
-//!
-//! let table = Adma2Buffer::new();
-//!
-//! # fn make_delay() -> impl DelayNs { struct N; impl DelayNs for N { fn delay_ns(&mut self, _: u32) {} } N }
-//! let inner = unsafe { Sdhci::new(0xFE31_0000) };
-//! let host = SdhciAdma2::new(inner, IdentityDma, &table);
-//! let mut card = SdioSdmmc::new(host, make_delay());
+//! # use platform::DmaImpl;
+//! let dma = DeviceDma::new(u32::MAX as u64, &DmaImpl);
+//! let mut host = unsafe { Sdhci::new_from_addr(0xFE31_0000) };
+//! let mut block = [0u8; 512];
+//! let ptr = NonNull::new(block.as_mut_ptr()).unwrap();
+//! host.dma_read_blocks_into(0, ptr, NonZeroUsize::new(block.len()).unwrap(), &dma)?;
+//! # Ok::<(), sdmmc_protocol::Error>(())
 //! ```
 //!
 //! Construction is `unsafe` because the caller must guarantee that the
@@ -64,7 +60,7 @@ mod dma;
 mod host;
 mod regs;
 
-pub use dma::{ADMA2_DESC_COUNT, Adma2Buffer, Dma, DmaDir, SdhciAdma2};
+pub use dma::{ADMA2_DESC_ALIGN, ADMA2_DESC_COUNT};
 pub use host::Sdhci;
 use sdmmc_protocol::{
     cmd::{Command, DataDirection},
@@ -75,17 +71,74 @@ use sdmmc_protocol::{
 
 use crate::{host::PendingData, regs::*};
 
+/// Stable controller event extracted from SDHCI interrupt-status registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// No status bit requiring runtime action is currently pending.
+    None,
+    /// A command response is ready to harvest.
+    CommandComplete,
+    /// A data transfer has completed.
+    TransferComplete,
+    /// One or more error bits are pending.
+    Error { normal: u16, error: u16 },
+    /// Status bits are pending but do not map to a high-level event yet.
+    Other { normal: u16, error: u16 },
+}
+
 impl SdioHost for Sdhci {
     fn send_command(&mut self, cmd: &Command) -> Result<Response, Error> {
         self.issue_command(cmd)
     }
 
-    fn read_data(&mut self, buf: &mut [u8], block_size: u32) -> Result<(), Error> {
-        self.pio_read(buf, block_size, self.active_data_cmd)
+    fn read_data(
+        &mut self,
+        cmd: &Command,
+        buf: &mut [u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error> {
+        match self.try_adma2_read_transfer(cmd, buf, block_size, block_count) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                log::debug!("sdhci: ADMA2 read transfer unavailable/failed: {:?}", err);
+                <Self as SdioHost>::prepare_data_transfer(
+                    self,
+                    DataDirection::Read,
+                    block_size,
+                    block_count,
+                )?;
+                <Self as SdioHost>::set_block_count(self, block_count)?;
+                let response = self.send_command(cmd)?;
+                self.pio_read(buf, block_size, self.active_data_cmd)?;
+                Ok(response)
+            }
+        }
     }
 
-    fn write_data(&mut self, buf: &[u8], block_size: u32) -> Result<(), Error> {
-        self.pio_write(buf, block_size, self.active_data_cmd)
+    fn write_data(
+        &mut self,
+        cmd: &Command,
+        buf: &[u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error> {
+        match self.try_adma2_write_transfer(cmd, buf, block_size, block_count) {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                log::debug!("sdhci: ADMA2 write transfer unavailable/failed: {:?}", err);
+                <Self as SdioHost>::prepare_data_transfer(
+                    self,
+                    DataDirection::Write,
+                    block_size,
+                    block_count,
+                )?;
+                <Self as SdioHost>::set_block_count(self, block_count)?;
+                let response = self.send_command(cmd)?;
+                self.pio_write(buf, block_size, self.active_data_cmd)?;
+                Ok(response)
+            }
+        }
     }
 
     fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error> {
@@ -279,5 +332,73 @@ impl SdioHost for Sdhci {
             Phase::Init,
             cmd_index,
         )))
+    }
+}
+
+pub(crate) fn event_from_status(normal: u16, error: u16) -> Event {
+    if normal & NORMAL_INT_ERROR != 0 {
+        Event::Error { normal, error }
+    } else if normal & NORMAL_INT_CMD_COMPLETE != 0 {
+        Event::CommandComplete
+    } else if normal & NORMAL_INT_XFER_COMPLETE != 0 {
+        Event::TransferComplete
+    } else if normal != 0 || error != 0 {
+        Event::Other { normal, error }
+    } else {
+        Event::None
+    }
+}
+
+impl Sdhci {
+    /// Read and acknowledge pending controller status, returning a stable
+    /// event for OS glue to translate into wakeups or worker scheduling.
+    pub fn handle_irq(&mut self) -> Event {
+        let normal = self.read_u16(REG_NORMAL_INT_STATUS);
+        let error = if normal & NORMAL_INT_ERROR != 0 {
+            self.read_u16(REG_ERROR_INT_STATUS)
+        } else {
+            0
+        };
+
+        if normal != 0 {
+            self.write_u16(REG_NORMAL_INT_STATUS, normal);
+        }
+        if error != 0 {
+            self.write_u16(REG_ERROR_INT_STATUS, error);
+        }
+
+        event_from_status(normal, error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_reports_command_completion_without_os_wakeup_policy() {
+        assert_eq!(
+            event_from_status(NORMAL_INT_CMD_COMPLETE, 0),
+            Event::CommandComplete
+        );
+    }
+
+    #[test]
+    fn event_reports_data_completion_without_os_wakeup_policy() {
+        assert_eq!(
+            event_from_status(NORMAL_INT_XFER_COMPLETE, 0),
+            Event::TransferComplete
+        );
+    }
+
+    #[test]
+    fn event_reports_error_status_without_translating_to_os_action() {
+        assert_eq!(
+            event_from_status(NORMAL_INT_ERROR, ERROR_INT_DATA_TIMEOUT),
+            Event::Error {
+                normal: NORMAL_INT_ERROR,
+                error: ERROR_INT_DATA_TIMEOUT,
+            }
+        );
     }
 }

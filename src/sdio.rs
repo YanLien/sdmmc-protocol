@@ -4,7 +4,7 @@
 //! Implement [`SdioHost`] for your platform's SDIO peripheral, and supply a
 //! [`DelayNs`] implementation so the driver can apply wall-clock timeouts.
 
-use embedded_hal::delay::DelayNs;
+pub use embedded_hal::delay::DelayNs;
 use log::{debug, info, warn};
 
 pub use crate::cmd::DataDirection;
@@ -77,11 +77,23 @@ pub trait SdioHost {
     /// Send a command and receive the response
     fn send_command(&mut self, cmd: &Command) -> Result<Response, Error>;
 
-    /// Read data from the card via the data bus
-    fn read_data(&mut self, buf: &mut [u8], block_size: u32) -> Result<(), Error>;
+    /// Issue a read-data command and complete its data phase.
+    fn read_data(
+        &mut self,
+        cmd: &Command,
+        buf: &mut [u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error>;
 
-    /// Write data to the card via the data bus
-    fn write_data(&mut self, buf: &[u8], block_size: u32) -> Result<(), Error>;
+    /// Issue a write-data command and complete its data phase.
+    fn write_data(
+        &mut self,
+        cmd: &Command,
+        buf: &[u8],
+        block_size: u32,
+        block_count: u32,
+    ) -> Result<Response, Error>;
 
     /// Set the bus width
     fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error>;
@@ -216,6 +228,11 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     /// Returns mutable access to the underlying SDIO host controller.
     pub fn host_mut(&mut self) -> &mut H {
         &mut self.host
+    }
+
+    /// Returns whether the initialized card uses sector addressing.
+    pub fn is_high_capacity(&self) -> bool {
+        self.high_capacity
     }
 
     /// Enable or disable optional SD CMD6 speed-mode selection.
@@ -526,16 +543,14 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     ///
     /// Caller must have selected the card (CMD7) before this. The data
     /// phase is read-only; the host is informed via
-    /// [`SdioHost::prepare_data_transfer`] so the controller pipelines
-    /// the right transfer mode for a single 512-byte read.
+    /// [`SdioHost::read_data`] so the controller can set up the right
+    /// transfer mode before issuing the command.
     fn read_ext_csd(&mut self) -> Result<crate::ext_csd::ExtCsd, Error> {
         info!("sdio: prepare EXT_CSD read");
-        self.host
-            .prepare_data_transfer(DataDirection::Read, 512, 1)?;
-        self.host.set_block_count(1)?;
-        let _r1 = self.host.send_command(&crate::cmd::CMD8_MMC)?;
         let mut buf = [0u8; 512];
-        self.host.read_data(&mut buf, 512)?;
+        let _r1 = self
+            .host
+            .read_data(&crate::cmd::CMD8_MMC, &mut buf, 512, 1)?;
         Ok(crate::ext_csd::ExtCsd::from_bytes(buf))
     }
 
@@ -796,21 +811,17 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     /// Read a single 512-byte block
     pub fn read_block(&mut self, addr: u32, buf: &mut [u8; 512]) -> Result<(), Error> {
         let block_addr = block_addr_of(addr, self.high_capacity);
-        self.host
-            .prepare_data_transfer(DataDirection::Read, 512, 1)?;
         let cmd = crate::cmd::cmd17(block_addr);
-        self.host.send_command(&cmd)?;
-        self.host.read_data(buf, 512)
+        self.host.read_data(&cmd, buf, 512, 1)?;
+        Ok(())
     }
 
     /// Write a single 512-byte block
     pub fn write_block(&mut self, addr: u32, buf: &[u8; 512]) -> Result<(), Error> {
         let block_addr = block_addr_of(addr, self.high_capacity);
-        self.host
-            .prepare_data_transfer(DataDirection::Write, 512, 1)?;
         let cmd = crate::cmd::cmd24(block_addr);
-        self.host.send_command(&cmd)?;
-        self.host.write_data(buf, 512)
+        self.host.write_data(&cmd, buf, 512, 1)?;
+        Ok(())
     }
 
     /// Read multiple blocks
@@ -818,43 +829,69 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     where
         F: FnMut(u32, &[u8; 512]),
     {
-        let block_addr = block_addr_of(addr, self.high_capacity);
-        self.host
-            .prepare_data_transfer(DataDirection::Read, 512, count)?;
-        self.host.set_block_count(count)?;
-        let cmd = crate::cmd::cmd18(block_addr);
-        self.host.send_command(&cmd)?;
-
         let mut buf = [0u8; 512];
         for i in 0..count {
-            self.host.read_data(&mut buf, 512)?;
+            self.read_block(addr + i, &mut buf)?;
             handler(addr + i, &buf);
         }
+        Ok(())
+    }
 
-        // CMD12: stop
-        self.host.send_command(&crate::cmd::CMD12)?;
+    /// Read one or more 512-byte blocks into a contiguous caller buffer.
+    ///
+    /// `buf.len()` must be a non-zero multiple of 512 bytes. For multi-block
+    /// reads the complete buffer is handed to the host in one data phase, so
+    /// host backends can use a single PIO/DMA setup instead of bouncing
+    /// through a temporary `[u8; 512]` per block.
+    pub fn read_blocks_into(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), Error> {
+        let count = block_count_from_len(buf.len())?;
+        let block_addr = block_addr_of(addr, self.high_capacity);
+        let cmd = if count == 1 {
+            crate::cmd::cmd17(block_addr)
+        } else {
+            crate::cmd::cmd18(block_addr)
+        };
+        self.host.read_data(&cmd, buf, 512, count)?;
+        if count > 1 {
+            self.host.send_command(&crate::cmd::CMD12)?;
+        }
         Ok(())
     }
 
     /// Write multiple blocks
     pub fn write_blocks(&mut self, addr: u32, blocks: &[[u8; 512]]) -> Result<(), Error> {
+        if blocks.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
         if blocks.len() == 1 {
             return self.write_block(addr, &blocks[0]);
         }
 
         let block_addr = block_addr_of(addr, self.high_capacity);
         let count = blocks.len() as u32;
-        self.host
-            .prepare_data_transfer(DataDirection::Write, 512, count)?;
-        self.host.set_block_count(count)?;
         let cmd = crate::cmd::cmd25(block_addr);
-        self.host.send_command(&cmd)?;
-
         let buf = blocks.as_flattened();
-        self.host.write_data(buf, 512)?;
-
-        // CMD12: stop
+        self.host.write_data(&cmd, buf, 512, count)?;
         self.host.send_command(&crate::cmd::CMD12)?;
+        Ok(())
+    }
+
+    /// Write one or more 512-byte blocks from a contiguous caller buffer.
+    ///
+    /// `buf.len()` must be a non-zero multiple of 512 bytes. For multi-block
+    /// writes the complete buffer is handed to the host in one data phase.
+    pub fn write_blocks_from(&mut self, addr: u32, buf: &[u8]) -> Result<(), Error> {
+        let count = block_count_from_len(buf.len())?;
+        let block_addr = block_addr_of(addr, self.high_capacity);
+        let cmd = if count == 1 {
+            crate::cmd::cmd24(block_addr)
+        } else {
+            crate::cmd::cmd25(block_addr)
+        };
+        self.host.write_data(&cmd, buf, 512, count)?;
+        if count > 1 {
+            self.host.send_command(&crate::cmd::CMD12)?;
+        }
         Ok(())
     }
 
@@ -891,14 +928,8 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
     /// (group 1 → high-speed). This lower-level entry point exposes the
     /// raw [`SwitchStatus`] for callers that need to inspect other groups.
     pub fn switch_function(&mut self, cmd: &Command) -> Result<SwitchStatus, Error> {
-        // CMD6 SWITCH_FUNC has a 64-byte read data phase. The host trait
-        // can't infer this from the command index alone (ACMD6 also uses
-        // index 6 with no data phase), so signal it explicitly here.
-        self.host
-            .prepare_data_transfer(DataDirection::Read, 64, 1)?;
-        self.host.send_command(cmd)?;
         let mut buf = [0u8; 64];
-        self.host.read_data(&mut buf, 64)?;
+        self.host.read_data(cmd, &mut buf, 64, 1)?;
         Ok(SwitchStatus::from_raw(buf))
     }
 
@@ -919,6 +950,13 @@ impl<H: SdioHost, D: DelayNs> SdioSdmmc<H, D> {
         }
         Ok(active)
     }
+}
+
+fn block_count_from_len(len: usize) -> Result<u32, Error> {
+    if len == 0 || !len.is_multiple_of(512) {
+        return Err(Error::Misaligned);
+    }
+    u32::try_from(len / 512).map_err(|_| Error::InvalidArgument)
 }
 
 /// Card information obtained during SDIO initialization
@@ -983,8 +1021,10 @@ mod tests {
         replies: Vec<Result<Response, Error>>,
         commands: Vec<Command>,
         bus_width: Option<BusWidth>,
+        prepared_transfers: Vec<(DataDirection, u32, u32)>,
         next_read_payload: Option<Vec<u8>>,
         read_payloads: Vec<Vec<u8>>,
+        writes: Vec<Vec<u8>>,
         /// When set, `set_bus_width(Bit8)` returns `UnsupportedCommand`
         /// to mimic a host (e.g. the SDHCI MVP backend) that hasn't
         /// wired up 8-bit operation yet.
@@ -1013,8 +1053,10 @@ mod tests {
                 replies: replies.into_iter().map(Ok).collect(),
                 commands: Vec::new(),
                 bus_width: None,
+                prepared_transfers: Vec::new(),
                 next_read_payload: None,
                 read_payloads: Vec::new(),
+                writes: Vec::new(),
                 reject_bit8: false,
                 last_clock: None,
                 last_voltage: None,
@@ -1031,8 +1073,10 @@ mod tests {
                 replies,
                 commands: Vec::new(),
                 bus_width: None,
+                prepared_transfers: Vec::new(),
                 next_read_payload: None,
                 read_payloads: Vec::new(),
+                writes: Vec::new(),
                 reject_bit8: false,
                 last_clock: None,
                 last_voltage: None,
@@ -1052,7 +1096,16 @@ mod tests {
             self.replies.remove(0)
         }
 
-        fn read_data(&mut self, buf: &mut [u8], _block_size: u32) -> Result<(), Error> {
+        fn read_data(
+            &mut self,
+            cmd: &Command,
+            buf: &mut [u8],
+            block_size: u32,
+            block_count: u32,
+        ) -> Result<Response, Error> {
+            self.prepared_transfers
+                .push((DataDirection::Read, block_size, block_count));
+            let response = self.send_command(cmd)?;
             let payload = if self.read_payloads.is_empty() {
                 self.next_read_payload.take()
             } else {
@@ -1061,14 +1114,24 @@ mod tests {
             match payload {
                 Some(data) if data.len() == buf.len() => {
                     buf.copy_from_slice(&data);
-                    Ok(())
+                    Ok(response)
                 }
                 _ => Err(Error::UnsupportedCommand),
             }
         }
 
-        fn write_data(&mut self, _buf: &[u8], _block_size: u32) -> Result<(), Error> {
-            Err(Error::UnsupportedCommand)
+        fn write_data(
+            &mut self,
+            cmd: &Command,
+            buf: &[u8],
+            block_size: u32,
+            block_count: u32,
+        ) -> Result<Response, Error> {
+            self.prepared_transfers
+                .push((DataDirection::Write, block_size, block_count));
+            let response = self.send_command(cmd)?;
+            self.writes.push(buf.to_vec());
+            Ok(response)
         }
 
         fn set_bus_width(&mut self, width: BusWidth) -> Result<(), Error> {
@@ -1081,6 +1144,17 @@ mod tests {
 
         fn set_clock(&mut self, speed: ClockSpeed) -> Result<(), Error> {
             self.last_clock = Some(speed);
+            Ok(())
+        }
+
+        fn prepare_data_transfer(
+            &mut self,
+            direction: DataDirection,
+            block_size: u32,
+            block_count: u32,
+        ) -> Result<(), Error> {
+            self.prepared_transfers
+                .push((direction, block_size, block_count));
             Ok(())
         }
 
@@ -1600,5 +1674,78 @@ mod tests {
         let mut driver = SdioSdmmc::new(host, NullDelay);
         let active = driver.switch_to_high_speed().unwrap();
         assert!(!active);
+    }
+
+    #[test]
+    fn read_blocks_into_uses_one_multi_block_transfer_for_contiguous_buffer() {
+        let mut host = MockHost::new(std::vec![ok_r1(), ok_r1()]);
+        let expected: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        host.next_read_payload = Some(expected.clone());
+
+        let mut driver = SdioSdmmc::new(host, NullDelay);
+        driver.high_capacity = true;
+        let mut buf = [0u8; 1024];
+
+        driver.read_blocks_into(7, &mut buf).unwrap();
+
+        assert_eq!(&buf[..], &expected[..]);
+        assert_eq!(
+            driver.host.prepared_transfers,
+            std::vec![(DataDirection::Read, 512, 2)]
+        );
+        assert_eq!(
+            driver
+                .host
+                .commands
+                .iter()
+                .map(|c| c.cmd)
+                .collect::<Vec<_>>(),
+            std::vec![18, 12]
+        );
+        assert_eq!(driver.host.commands[0].arg, 7);
+    }
+
+    #[test]
+    fn write_blocks_from_uses_one_multi_block_transfer_for_contiguous_buffer() {
+        let host = MockHost::new(std::vec![ok_r1(), ok_r1()]);
+        let mut driver = SdioSdmmc::new(host, NullDelay);
+        driver.high_capacity = true;
+        let buf = [0x5au8; 1024];
+
+        driver.write_blocks_from(11, &buf).unwrap();
+
+        assert_eq!(
+            driver.host.prepared_transfers,
+            std::vec![(DataDirection::Write, 512, 2)]
+        );
+        assert_eq!(
+            driver
+                .host
+                .commands
+                .iter()
+                .map(|c| c.cmd)
+                .collect::<Vec<_>>(),
+            std::vec![25, 12]
+        );
+        assert_eq!(driver.host.commands[0].arg, 11);
+        assert_eq!(driver.host.writes, std::vec![buf.to_vec()]);
+    }
+
+    #[test]
+    fn contiguous_multi_block_io_rejects_misaligned_buffers() {
+        let host = MockHost::new(std::vec![]);
+        let mut driver = SdioSdmmc::new(host, NullDelay);
+        let mut read_buf = [0u8; 513];
+        let write_buf = [0u8; 513];
+
+        assert_eq!(
+            driver.read_blocks_into(0, &mut read_buf),
+            Err(Error::Misaligned)
+        );
+        assert_eq!(
+            driver.write_blocks_from(0, &write_buf),
+            Err(Error::Misaligned)
+        );
+        assert!(driver.host.commands.is_empty());
     }
 }

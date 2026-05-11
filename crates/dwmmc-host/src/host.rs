@@ -11,6 +11,7 @@
 
 use core::ptr::NonNull;
 
+use dma_api::DeviceDma;
 use sdmmc_protocol::{
     error::{Error, ErrorContext, Phase},
     sdio::{ClockSpeed, SignalVoltage},
@@ -54,24 +55,25 @@ pub(crate) struct PendingData {
 /// multiple `DwMmc` instances is undefined.
 pub struct DwMmc {
     pub(crate) regs: VolatilePtr<'static, RegisterBlock>,
-    pub(crate) base_addr: usize,
+    pub(crate) base: NonNull<u8>,
     pub(crate) fifo_offset: usize,
     pub(crate) ref_clock_hz: u32,
     pub(crate) pending_data: Option<PendingData>,
     pub(crate) data_blocks_remaining: u32,
     pub(crate) data_cmd_index: u8,
+    pub(crate) dma: Option<DeviceDma>,
 }
 
 impl DwMmc {
-    /// Construct a `DwMmc` over the given MMIO base, using the default
+    /// Construct a `DwMmc` over an already-mapped MMIO register file, using the default
     /// FIFO offset (`0x200`).
     ///
     /// # Safety
     ///
-    /// `base_addr` must point to a memory-mapped DW_mshc register file
+    /// `base` must point to a memory-mapped DW_mshc register file
     /// the caller has exclusive access to.
-    pub unsafe fn new(base_addr: usize) -> Self {
-        unsafe { Self::new_with_fifo_offset(base_addr, DEFAULT_FIFO_OFFSET) }
+    pub unsafe fn new(base: NonNull<u8>) -> Self {
+        unsafe { Self::new_with_fifo_offset(base, DEFAULT_FIFO_OFFSET) }
     }
 
     /// Construct a `DwMmc` with an explicit FIFO offset.
@@ -84,17 +86,44 @@ impl DwMmc {
     ///
     /// Same contract as [`DwMmc::new`]; `fifo_offset` must match the
     /// hardware.
-    pub unsafe fn new_with_fifo_offset(base_addr: usize, fifo_offset: usize) -> Self {
-        let regs = unsafe { VolatilePtr::new(NonNull::new_unchecked(base_addr as *mut _)) };
+    pub unsafe fn new_with_fifo_offset(base: NonNull<u8>, fifo_offset: usize) -> Self {
+        let regs = unsafe { VolatilePtr::new(base.cast()) };
         Self {
             regs,
-            base_addr,
+            base,
             fifo_offset,
             ref_clock_hz: 0,
             pending_data: None,
             data_blocks_remaining: 0,
             data_cmd_index: 0,
+            dma: None,
         }
+    }
+
+    /// Construct a `DwMmc` from a raw mapped MMIO address.
+    ///
+    /// Prefer [`DwMmc::new`] when OS glue already tracks the mapping as a
+    /// non-null pointer. This helper keeps legacy bring-up code explicit
+    /// about where the raw address crosses into the portable driver core.
+    ///
+    /// # Safety
+    ///
+    /// `base_addr` must be non-zero and point to a memory-mapped DW_mshc
+    /// register file that the caller has exclusive access to.
+    pub unsafe fn new_from_addr(base_addr: usize) -> Self {
+        let base = NonNull::new(base_addr as *mut u8).expect("MMIO base address must be non-null");
+        unsafe { Self::new(base) }
+    }
+
+    /// Construct a `DwMmc` from a raw mapped MMIO address and explicit FIFO offset.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`DwMmc::new_from_addr`]; `fifo_offset` must match the
+    /// hardware.
+    pub unsafe fn new_from_addr_with_fifo_offset(base_addr: usize, fifo_offset: usize) -> Self {
+        let base = NonNull::new(base_addr as *mut u8).expect("MMIO base address must be non-null");
+        unsafe { Self::new_with_fifo_offset(base, fifo_offset) }
     }
 
     /// Tell the driver the reference clock fed to the controller, in Hz.
@@ -106,6 +135,15 @@ impl DwMmc {
     /// platform CRU is doing all the rate scaling.
     pub fn set_reference_clock(&mut self, ref_clock_hz: u32) {
         self.ref_clock_hz = ref_clock_hz;
+    }
+
+    /// Install a DMA capability used by high-level data-transfer hooks.
+    ///
+    /// Once installed, `SdioHost::read_data` and `SdioHost::write_data` try
+    /// the internal IDMAC for 512-byte block I/O and fall back to PIO if it
+    /// cannot be used.
+    pub fn set_dma(&mut self, dma: DeviceDma) {
+        self.dma = Some(dma);
     }
 
     /// Bring the controller to a known state and arm it for card
@@ -323,9 +361,31 @@ impl DwMmc {
     /// Raw pointer at `base + fifo_offset`, used for 64-bit FIFO
     /// accesses in [`crate::data`].
     pub(crate) fn fifo_ptr(&self) -> *mut u64 {
-        (self.base_addr + self.fifo_offset) as *mut u64
+        unsafe { self.base.as_ptr().add(self.fifo_offset).cast::<u64>() }
     }
 }
 
 unsafe impl Send for DwMmc {}
 unsafe impl Sync for DwMmc {}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+
+    use super::*;
+
+    #[test]
+    fn constructs_from_mapped_mmio_pointer() {
+        let base = NonNull::new(0x1000_0000 as *mut u8).unwrap();
+        let host = unsafe { DwMmc::new(base) };
+
+        assert_eq!(host.base.as_ptr() as usize, 0x1000_0000);
+    }
+
+    #[test]
+    fn legacy_addr_constructor_keeps_raw_mmio_boundary_explicit() {
+        let host = unsafe { DwMmc::new_from_addr(0x1000_0000) };
+
+        assert_eq!(host.base.as_ptr() as usize, 0x1000_0000);
+    }
+}
